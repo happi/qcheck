@@ -23,13 +23,13 @@ curl -fsSL -o qcheck https://github.com/happi/qcheck/releases/latest/download/qc
 chmod +x qcheck
 ```
 
-Pin a version in CI by replacing `latest/download` with `download/v0.2.0`.
+Pin a version in CI by replacing `latest/download` with `download/v0.3.0`.
 From source: `cargo build --release -p qcheck-api --bin qcheck` in a
 checkout, which picks up the build flag in `.cargo/config.toml`.
 
 ## Checking an API from its description
 
-`api/examples/buggy_pets.rs` is a small pet API with three planted bugs, and
+`api/examples/buggy_pets.rs` is a small pet API with five planted bugs, and
 `api/examples/pets.yaml` describes it. Start the server, then point qcheck at
 the description:
 
@@ -42,7 +42,7 @@ cargo run -p qcheck-api --bin qcheck -- openapi api/examples/pets.yaml \
 Captured output:
 
 ```
-api/examples/pets.yaml: 4 operations, 100 requests each, http://127.0.0.1:8642 over HTTP/2, seed 1
+api/examples/pets.yaml: 5 operations, 100 requests each, http://127.0.0.1:8642 over HTTP/2, seed 1
 
 ok    GET /health (health): 100 requests (200 x100)
 FAIL  GET /pets (listPets): after 1 passing request
@@ -71,14 +71,27 @@ FAIL  GET /pets/{id} (getPet): after 3 passing requests
       original: GET /pets/9007199254740992  (before 51 shrinks)
       replay:   curl -i --http2-prior-knowledge -X GET 'http://127.0.0.1:8642/pets/1001' -H 'accept: application/json'
       rerun:    add --seed 1 --operation 'getPet'
+ok    DELETE /pets/{id} (deletePet): 100 requests (204 x23, 404 x77)
+FAIL  sequences: after 5 passing sequences
+      check:    created-is-readable
+      reason:   GET /pets/585 answered 404 after a POST created it
+      calls:    1. POST /pets  -> 201
+                   {"age":30,"name":"a"}
+                2. GET /pets/585  -> 404
+      rerun:    add --seed 1
 
-1 passed, 3 failed, 0 skipped
+2 passed, 4 failed, 0 skipped
 ```
 
 A passing operation lists the statuses it saw. When none of them is a 2xx,
 qcheck adds a note: every request was rejected, so only the error path was
 checked. That usually means the operation needs existing data or
 credentials the run did not have.
+
+The last entry is a sequence of calls. Three of the five bugs show on a
+single request. The other two need state: here a pet created at age 30 is
+reported as created and then cannot be read. The next section covers
+sequences.
 
 Look at `createPet`. The first failing body had a twenty-character name and
 an age of 14. The shrunk body has eleven `a`s and an age of 0. The
@@ -154,6 +167,42 @@ Authentication is yours to supply: pass the header with `-H`, for example
 `-H 'Authorization: Bearer ...'`. Security schemes in the description are
 not read.
 
+## Sequences of calls
+
+A single generated request can only ask for ids that do not exist, so on
+its own it checks little more than the 404. After the single requests,
+qcheck runs sequences: several calls on the same kind of resource, where a
+later call uses what an earlier response returned.
+
+In the report above, the `POST` returned `{"id": 585, ...}`, and the `GET`
+that followed used that id. qcheck remembers the strings and numbers in
+each successful response by property name. A path parameter `{id}` in
+`/pets/{id}` is filled from what `/pets` returned; other parameters match
+by name, and `pet_id` or `petId` also match the `id` of a pet.
+
+Every call in a sequence is held to the single-request checks. Two more
+apply across calls:
+
+| Check | A sequence fails when |
+|---|---|
+| `deleted-stays-deleted` | a `GET` succeeds on a path whose `DELETE` succeeded earlier |
+| `created-is-readable` | a `GET` returns 404 for a resource a `POST` created earlier |
+
+A failing sequence shrinks like a failing request: calls are dropped and
+values simplified until the shortest sequence that still fails is left.
+Here it is two calls, and the body kept the one value that matters, the
+age of 30.
+
+`--sequences` sets how many run (50 by default, 0 for none) and
+`--sequence-length` the most calls in one (8). The server keeps its state
+between sequences, so a shrunk sequence may lean on something an earlier
+one left behind. When that gets in the way, `--reset` names a command that
+restores the server, and qcheck runs it before each sequence.
+
+An operation that fails alone still takes part, without the check it
+failed, since a create with an undocumented status still creates what the
+later calls need.
+
 ## HTTP versions
 
 `--http` selects the protocol version: `1.0`, `1.1`, `2`, `3`, or `auto`.
@@ -218,9 +267,11 @@ forall(gens::range(0i64, 1000), |n| {
   operation.
 - File uploads, multipart forms, and request bodies other than JSON and
   URL-encoded forms. Such operations are reported as skipped.
-- Invalid requests that should be rejected with a 4xx.
-- Sequences of calls checked against a model (state machine testing), and
-  test case statistics. QuviQ QuickCheck and PropEr have both.
+- A model of the API's state. Sequences reuse returned values and apply two
+  general checks; they do not yet compare responses with what a model
+  predicts, as the state machine libraries of QuviQ QuickCheck and PropEr
+  do.
+- Invalid requests, and per-operation headers.
 - In the library: floats, `Result`, collections beyond `Vec`, and a test
   attribute, which the Rust `quickcheck` crate has.
 

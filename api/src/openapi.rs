@@ -30,15 +30,23 @@ pub enum Check {
     ContentType,
     /// The body conforms to the schema documented for the status.
     ResponseSchema,
+    /// In a sequence: after a DELETE succeeded, a GET of the same path
+    /// does not succeed.
+    DeletedStaysDeleted,
+    /// In a sequence: after a POST created a resource, a GET of it is
+    /// not answered with 404.
+    CreatedIsReadable,
 }
 
 impl Check {
-    pub const ALL: [Check; 5] = [
+    pub const ALL: [Check; 7] = [
         Check::Transport,
         Check::NoServerError,
         Check::DocumentedStatus,
         Check::ContentType,
         Check::ResponseSchema,
+        Check::DeletedStaysDeleted,
+        Check::CreatedIsReadable,
     ];
 
     pub fn name(self) -> &'static str {
@@ -48,6 +56,8 @@ impl Check {
             Check::DocumentedStatus => "documented-status",
             Check::ContentType => "content-type",
             Check::ResponseSchema => "response-schema",
+            Check::DeletedStaysDeleted => "deleted-stays-deleted",
+            Check::CreatedIsReadable => "created-is-readable",
         }
     }
 
@@ -155,14 +165,14 @@ impl Spec {
 }
 
 #[derive(Clone)]
-struct Parameter {
-    name: String,
+pub(crate) struct Parameter {
+    pub(crate) name: String,
     /// `path`, `query`, `header`, `cookie`, `formData`, `body`, or `form`
     /// for a URL-encoded body described by one object schema.
-    location: String,
-    required: bool,
-    schema: Value,
-    collection_format: String,
+    pub(crate) location: String,
+    pub(crate) required: bool,
+    pub(crate) schema: Value,
+    pub(crate) collection_format: String,
 }
 
 /// What the description says about the response for one status.
@@ -176,11 +186,11 @@ struct Documented {
 /// One method on one path.
 #[derive(Clone)]
 pub struct Operation {
-    root: Rc<Value>,
+    pub(crate) root: Rc<Value>,
     pub method: String,
     pub path: String,
     pub operation_id: Option<String>,
-    parameters: Vec<Parameter>,
+    pub(crate) parameters: Vec<Parameter>,
     /// The media type of a JSON request body.
     body_media: String,
     /// The `Accept` header, when the description gives grounds for one.
@@ -476,6 +486,14 @@ impl Operation {
     /// so without one an id-based route is only ever asked for ids that
     /// do not exist.
     pub fn requests_with(&self, fixtures: &[(String, Value)]) -> Generator<HttpRequest> {
+        let operation = self.clone();
+        self.values(fixtures)
+            .map(move |values| operation.build(&values))
+    }
+
+    /// One value per parameter, in parameter order; `None` for an optional
+    /// parameter that is left out. `build` turns them into a request.
+    pub(crate) fn values(&self, fixtures: &[(String, Value)]) -> Generator<Vec<Option<Value>>> {
         let known = |name: &str| -> Vec<Value> {
             let matching = fixtures.iter().filter(|(n, _)| n == name);
             matching.map(|(_, value)| value.clone()).collect()
@@ -544,11 +562,10 @@ impl Operation {
             });
         }
 
-        let operation = self.clone();
-        values.map(move |values| operation.build(&values))
+        values
     }
 
-    fn build(&self, values: &[Option<Value>]) -> HttpRequest {
+    pub(crate) fn build(&self, values: &[Option<Value>]) -> HttpRequest {
         let mut request = HttpRequest {
             method: self.method.clone(),
             path: self.path.clone(),
@@ -701,7 +718,7 @@ fn glob(pattern: &str, text: &str) -> bool {
 
 /// A parameter value as one string. Arrays are joined by the collection
 /// format; `multi` is handled by the caller.
-fn flat(value: &Value, collection_format: &str) -> String {
+pub(crate) fn flat(value: &Value, collection_format: &str) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Null => String::new(),
@@ -747,6 +764,13 @@ pub struct Options {
     /// Values known to exist on the server, by parameter or body property
     /// name. See [`Operation::requests_with`].
     pub fixtures: Vec<(String, Value)>,
+    /// How many sequences of calls to run after the single-request checks.
+    pub sequences: u32,
+    /// The most calls in one sequence.
+    pub sequence_length: usize,
+    /// A shell command that puts the server back in a known state. It
+    /// runs before each sequence.
+    pub reset: Option<String>,
 }
 
 impl Default for Options {
@@ -757,6 +781,9 @@ impl Default for Options {
             max_shrinks: 500,
             checks: Check::ALL.to_vec(),
             fixtures: Vec::new(),
+            sequences: 50,
+            sequence_length: 8,
+            reset: None,
         }
     }
 }

@@ -58,6 +58,16 @@ paths:
         404:
           description: No pet has this id.
           schema: {$ref: "#/definitions/Error"}
+    delete:
+      operationId: deletePet
+      parameters:
+        - {name: id, in: path, required: true, type: integer, format: int64, minimum: 1}
+      responses:
+        204:
+          description: The pet is gone.
+        404:
+          description: No pet has this id.
+          schema: {$ref: "#/definitions/Error"}
 
 definitions:
   NewPet:

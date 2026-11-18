@@ -15,6 +15,7 @@ pub mod exec;
 pub mod http;
 pub mod openapi;
 pub mod schema;
+pub mod sequence;
 
 pub use adapter::{send, Adapter, Body, HttpRequest, HttpResponse};
 pub use exec::ExecAdapter;

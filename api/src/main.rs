@@ -2,6 +2,7 @@
 
 use qcheck::{Gen, QuickCheck};
 use qcheck_api::openapi::{check_operation, Check, Failure, Operation, Options, Spec, Verdict};
+use qcheck_api::sequence::{check_sequences, SequenceVerdict};
 use qcheck_api::{Adapter, ExecAdapter, HttpAdapter, HttpOptions, HttpRequest, HttpVersion};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -46,6 +47,12 @@ Run:
   --tests <n>           Requests per operation. Default: 100.
   --seed <n>            Replay a run.
   --max-shrinks <n>     Requests spent shrinking one failure. Default: 500.
+  --sequences <n>       Sequences of calls to run after the single requests,
+                        where later calls use ids from earlier responses.
+                        Default: 50. 0 turns them off.
+  --sequence-length <n> The most calls in one sequence. Default: 8.
+  --reset <command>     Shell command that restores the server's state. It
+                        runs before each sequence.
   --set <name=value>    A value known to exist on the server, for the
                         parameter or body property of that name. Half the
                         requests use it. May be repeated.
@@ -62,7 +69,9 @@ Run:
                         'text @check,check  # reason' leaves out only the
                         named checks for the matching operations.
   --skip-check <name>   Disable a check: transport, no-server-error,
-                        documented-status, content-type, response-schema.
+                        documented-status, content-type, response-schema,
+                        and for sequences deleted-stays-deleted,
+                        created-is-readable.
   --dry-run             Print one generated request per operation and send
                         nothing.
 
@@ -128,6 +137,11 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--tests" => parsed.options.tests = number(value("a count")?)? as u32,
             "--seed" => parsed.options.seed = Some(number(value("a seed")?)?),
             "--max-shrinks" => parsed.options.max_shrinks = number(value("a count")?)? as u32,
+            "--sequences" => parsed.options.sequences = number(value("a count")?)? as u32,
+            "--sequence-length" => {
+                parsed.options.sequence_length = number(value("a count")?)? as usize
+            }
+            "--reset" => parsed.options.reset = Some(value("a command")?),
             "--set" => {
                 let text = value("name=value")?;
                 let (name, fixed) = text
@@ -350,6 +364,11 @@ fn run(args: &Args) -> Result<bool, String> {
     );
 
     let (mut passed, mut failed, mut skipped) = (0, 0, 0);
+    // Every operation that ran goes on to the sequences, with the checks
+    // that apply to it. One that failed alone has been reported, so it
+    // takes part without the check it failed: a create that returns an
+    // undocumented status still creates what later calls need.
+    let mut sound: Vec<(Operation, Vec<Check>)> = Vec::new();
     for operation in &operations {
         if let Some((_, reason)) = args.excluded.iter().find(|(f, _)| operation.matches(f)) {
             skipped += 1;
@@ -369,6 +388,7 @@ fn run(args: &Args) -> Result<bool, String> {
         match verdict {
             Verdict::Passed { tests, statuses } => {
                 passed += 1;
+                sound.push((operation.clone(), options.checks.clone()));
                 let seen: Vec<String> = statuses
                     .iter()
                     .map(|(status, count)| format!("{status} x{count}"))
@@ -392,6 +412,9 @@ fn run(args: &Args) -> Result<bool, String> {
             }
             Verdict::Failed(failure) => {
                 failed += 1;
+                let mut checks = options.checks.clone();
+                checks.retain(|check| *check != failure.violation.check);
+                sound.push((operation.clone(), checks));
                 say!(
                     "FAIL  {operation}: after {}",
                     plural(failure.passed, "passing request")
@@ -404,6 +427,57 @@ fn run(args: &Args) -> Result<bool, String> {
         }
         for warning in &operation.warnings {
             say!("      note: {warning}");
+        }
+    }
+    match check_sequences(&sound, adapter.as_ref(), &options) {
+        SequenceVerdict::Skipped(_) => {}
+        SequenceVerdict::Passed {
+            sequences,
+            calls,
+            reused,
+            statuses,
+        } => {
+            passed += 1;
+            let seen: Vec<String> = statuses
+                .iter()
+                .map(|(status, count)| format!("{status} x{count}"))
+                .collect();
+            say!(
+                "ok    sequences: {}, {} ({})",
+                plural(sequences, "sequence"),
+                plural(calls, "call"),
+                seen.join(", ")
+            );
+            say!(
+                "      {} used a value from an earlier response",
+                plural(reused, "call")
+            );
+        }
+        SequenceVerdict::Failed(failure) => {
+            failed += 1;
+            say!(
+                "FAIL  sequences: after {}",
+                plural(failure.passed, "passing sequence")
+            );
+            say!("      check:    {}", failure.violation.check.name());
+            say!("      reason:   {}", clip(&failure.violation.message, 400));
+            for (index, call) in failure.calls.iter().enumerate() {
+                let label = if index == 0 { "calls:" } else { "" };
+                let status = match call.status {
+                    Some(status) => status.to_string(),
+                    None => "no response".to_string(),
+                };
+                say!(
+                    "      {label:<9} {}. {} {}  -> {status}",
+                    index + 1,
+                    call.request.method,
+                    call.request.target()
+                );
+                if let Some(body) = call.request.body_text() {
+                    say!("      {:<9}    {}", "", clip(&body, 300));
+                }
+            }
+            say!("      rerun:    add --seed {seed}");
         }
     }
     say!("\n{passed} passed, {failed} failed, {skipped} skipped");

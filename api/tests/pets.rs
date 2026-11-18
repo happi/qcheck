@@ -194,11 +194,15 @@ fn a_filter_with_a_star_is_a_pattern_for_the_operation_id() {
         let matching = spec.operations().into_iter().filter(|o| o.matches(filter));
         matching.filter_map(|o| o.operation_id).collect()
     };
-    assert_eq!(ids("*Pet"), ["createPet", "getPet"]);
-    assert_eq!(ids("*Pet*"), ["listPets", "createPet", "getPet"]);
+    assert_eq!(ids("*Pet"), ["createPet", "getPet", "deletePet"]);
+    assert_eq!(
+        ids("*Pet*"),
+        ["listPets", "createPet", "getPet", "deletePet"]
+    );
     assert_eq!(ids("get*"), ["getPet"]);
     assert_eq!(ids("getPet"), ["getPet"]);
     assert_eq!(ids("GET /pets"), ["listPets", "getPet"]);
+    assert_eq!(ids("/pets/{id}"), ["getPet", "deletePet"]);
 }
 
 #[test]

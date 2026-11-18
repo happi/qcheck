@@ -1,4 +1,5 @@
-//! A pet API with three planted bugs, for qcheck to find. It serves
+//! A pet API with five planted bugs, for qcheck to find. Three show on a
+//! single request and two only across a sequence of calls. It serves
 //! `examples/pets.yaml` over HTTP/1.0, HTTP/1.1 and HTTP/2 (h2c).
 //!
 //!   cargo run -p qcheck-api --example buggy_pets          # port 8642
@@ -14,15 +15,32 @@ use hyper::{Method, Request, Response};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::{SocketAddr, TcpListener};
+use std::sync::{Arc, Mutex};
 
 fn pet(id: i64) -> Value {
     json!({"id": id, "name": format!("pet{id}"), "age": id % 30})
 }
 
-/// The API itself: a status and a JSON body for each request.
-pub fn route(method: &Method, path: &str, query: &str, body: &[u8]) -> (u16, Value) {
+/// The pets that requests have created, by id.
+#[derive(Default)]
+pub struct Store {
+    pets: BTreeMap<i64, Value>,
+    created: i64,
+}
+
+/// The API itself: a status and a JSON body for each request. A null body
+/// is sent as an empty one.
+pub fn route(
+    store: &Mutex<Store>,
+    method: &Method,
+    path: &str,
+    query: &str,
+    body: &[u8],
+) -> (u16, Value) {
+    let mut store = store.lock().expect("the store lock");
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match (method.as_str(), segments.as_slice()) {
         ("GET", ["health"]) => (200, json!({"status": "ok"})),
@@ -41,6 +59,7 @@ pub fn route(method: &Method, path: &str, query: &str, body: &[u8]) -> (u16, Val
         }
 
         ("GET", ["pets", id]) => match id.parse::<i64>() {
+            Ok(id) if store.pets.contains_key(&id) => (200, store.pets[&id].clone()),
             // Bug 2: pets imported from the old system have no name.
             Ok(id) if id > 1000 => (200, json!({"id": id, "name": null, "age": 3})),
             Ok(id) if id % 2 == 0 => (200, pet(id)),
@@ -58,12 +77,33 @@ pub fn route(method: &Method, path: &str, query: &str, body: &[u8]) -> (u16, Val
             if name.chars().count() > 10 {
                 return (422, json!({"error": "name too long"}));
             }
-            let mut stored = json!({"id": 7, "name": name, "age": age});
+            // Created pets get odd ids from 7 up; the even ids are the
+            // built-in pets above.
+            store.created += 1;
+            let id = 5 + 2 * store.created;
+            let mut stored = json!({"id": id, "name": name, "age": age});
             if let Some(tag) = new.get("tag") {
                 stored["tag"] = tag.clone();
             }
+            // Bug 4: the oldest allowed age is 30, and this check drops it.
+            // The pet is reported as created and can never be read.
+            if age < 30 {
+                store.pets.insert(id, stored.clone());
+            }
             (201, stored)
         }
+
+        ("DELETE", ["pets", id]) => match id.parse::<i64>() {
+            Ok(id) if store.pets.contains_key(&id) => {
+                // Bug 5: a tagged pet is kept "for the tag index", so it
+                // can still be read after its delete succeeded.
+                if store.pets[&id].get("tag").is_none() {
+                    store.pets.remove(&id);
+                }
+                (204, Value::Null)
+            }
+            _ => (404, json!({"error": "no such pet"})),
+        },
 
         // Not part of the described API. It returns what arrived, so a test
         // can compare a request with what the server saw.
@@ -76,7 +116,10 @@ pub fn route(method: &Method, path: &str, query: &str, body: &[u8]) -> (u16, Val
     }
 }
 
-async fn handle(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+async fn handle(
+    store: Arc<Mutex<Store>>,
+    request: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, Infallible> {
     let version = format!("{:?}", request.version());
     let method = request.method().clone();
     let path = request.uri().path().to_string();
@@ -86,13 +129,17 @@ async fn handle(request: Request<Incoming>) -> Result<Response<Full<Bytes>>, Inf
         Err(_) => Bytes::new(),
     };
 
-    let (status, json) = route(&method, &path, &query, &body);
+    let (status, json) = route(&store, &method, &path, &query, &body);
+    let text = match json {
+        Value::Null => String::new(),
+        json => json.to_string(),
+    };
     let response = Response::builder()
         .status(status)
         .header("content-type", "application/json")
         // Lets a client confirm which protocol version the server saw.
         .header("x-request-version", version)
-        .body(Full::new(Bytes::from(json.to_string())))
+        .body(Full::new(Bytes::from(text)))
         .expect("a valid response");
     Ok(response)
 }
@@ -102,6 +149,7 @@ fn serve(listener: TcpListener) {
         .enable_all()
         .build()
         .expect("a tokio runtime");
+    let store = Arc::new(Mutex::new(Store::default()));
     runtime.block_on(async {
         listener
             .set_nonblocking(true)
@@ -111,10 +159,12 @@ fn serve(listener: TcpListener) {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
             };
+            let store = store.clone();
             tokio::spawn(async move {
                 let connection = Builder::new(TokioExecutor::new());
+                let service = service_fn(move |request| handle(store.clone(), request));
                 let _ = connection
-                    .serve_connection(TokioIo::new(stream), service_fn(handle))
+                    .serve_connection(TokioIo::new(stream), service)
                     .await;
             });
         }

@@ -63,6 +63,15 @@ paths:
               schema: {$ref: "#/components/schemas/Pet"}
         "404":
           $ref: "#/components/responses/Error"
+    delete:
+      operationId: deletePet
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: integer, exclusiveMinimum: 0}}
+      responses:
+        "204":
+          description: The pet is gone.
+        "404":
+          $ref: "#/components/responses/Error"
 
 components:
   responses:
