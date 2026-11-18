@@ -81,13 +81,19 @@ fn discards_do_not_count_as_tests() {
             TestResult::Fail("max is not the maximum".into())
         }
     });
-    assert!(matches!(outcome, Outcome::Passed { tests: 100 }), "{outcome:?}");
+    assert!(
+        matches!(outcome, Outcome::Passed { tests: 100 }),
+        "{outcome:?}"
+    );
 }
 
 #[test]
 fn an_unmeetable_precondition_gives_up() {
     let outcome = QuickCheck::new().seed(5).run(|_: u8| TestResult::Discard);
-    assert!(matches!(outcome, Outcome::GaveUp { tests: 0, .. }), "{outcome:?}");
+    assert!(
+        matches!(outcome, Outcome::GaveUp { tests: 0, .. }),
+        "{outcome:?}"
+    );
 }
 
 #[test]

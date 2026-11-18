@@ -82,9 +82,14 @@ impl<A: Debug> fmt::Display for Failure<A> {
 
 #[derive(Debug, Clone)]
 pub enum Outcome<A> {
-    Passed { tests: u32 },
+    Passed {
+        tests: u32,
+    },
     /// Too many inputs were discarded to reach the requested test count.
-    GaveUp { tests: u32, discards: u32 },
+    GaveUp {
+        tests: u32,
+        discards: u32,
+    },
     Failed(Failure<A>),
 }
 
@@ -168,7 +173,10 @@ impl QuickCheck {
                 TestResult::Discard => {
                     discards += 1;
                     if discards > self.max_discards {
-                        return Outcome::GaveUp { tests: passed, discards };
+                        return Outcome::GaveUp {
+                            tests: passed,
+                            discards,
+                        };
                     }
                 }
                 TestResult::Fail(reason) => {

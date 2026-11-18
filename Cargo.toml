@@ -3,6 +3,7 @@ name = "qcheck"
 version = "0.1.0"
 edition = "2021"
 description = "A small QuickCheck: random property testing with shrinking, no dependencies"
+license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
