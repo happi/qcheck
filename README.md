@@ -1,10 +1,179 @@
 # qcheck
 
-A small QuickCheck in Rust. You state a property, qcheck tests it on random
-inputs, and a failure comes back as the smallest input it can find. The
-library has no dependencies.
+QuickCheck for APIs. qcheck generates requests, sends them to a running
+API, and checks each response. When a check fails, it shrinks the request
+to the smallest one that still fails.
 
-## A property
+It tests from the outside, through an adapter, so the API can be written in
+any language. Two adapters are built in: HTTP (versions 1.0, 1.1, 2 and 3)
+and a helper process that speaks JSON lines. Given an OpenAPI 2.0
+description, qcheck derives the requests and the checks itself.
+
+The repository holds two crates. `qcheck` is the property testing library,
+with no dependencies. `qcheck-api` in `api/` adds the adapters, the OpenAPI
+support, and the `qcheck` command.
+
+## Checking an API from its description
+
+`api/examples/buggy_pets.rs` is a small pet API with three planted bugs, and
+`api/examples/pets.yaml` describes it. Start the server, then point qcheck at
+the description:
+
+```
+cargo run -p qcheck-api --example buggy_pets &
+cargo run -p qcheck-api --bin qcheck -- openapi api/examples/pets.yaml \
+    --base-url http://127.0.0.1:8642 --http 2 --seed 1
+```
+
+Captured output:
+
+```
+api/examples/pets.yaml: 4 operations, 100 requests each, http://127.0.0.1:8642 over HTTP/2, seed 1
+
+ok    GET /health (health): 100 requests
+FAIL  GET /pets (listPets): after 1 passing request
+      check:    no-server-error
+      reason:   server error: status 500
+      request:  GET /pets?limit=0
+      response: HTTP/2.0 500 {"error":"attempt to divide by zero"}
+      original: GET /pets?limit=0&tag=y%7D-%22hM8%2C99  (before 1 shrink)
+      replay:   curl -i --http2-prior-knowledge -X GET 'http://127.0.0.1:8642/pets?limit=0' -H 'accept: application/json'
+      rerun:    add --seed 1 --operation 'listPets'
+FAIL  POST /pets (createPet): after 0 passing requests
+      check:    documented-status
+      reason:   status 422 is not documented (documented: 201, 400)
+      request:  POST /pets
+                {"age":0,"name":"aaaaaaaaaaa"}
+      response: HTTP/2.0 422 {"error":"name too long"}
+      original: POST /pets  (before 14 shrinks)
+                {"age":14,"name":"NN:<Uz?J1OVMo5=8<fhS"}
+      replay:   curl -i --http2-prior-knowledge -X POST 'http://127.0.0.1:8642/pets' -H 'accept: application/json' -H 'content-type: application/json' --data-raw '{"age":0,"name":"aaaaaaaaaaa"}'
+      rerun:    add --seed 1 --operation 'createPet'
+FAIL  GET /pets/{id} (getPet): after 3 passing requests
+      check:    response-schema
+      reason:   $.name: expected string, got null
+      request:  GET /pets/1001
+      response: HTTP/2.0 200 {"age":3,"id":1001,"name":null}
+      original: GET /pets/9007199254740992  (before 51 shrinks)
+      replay:   curl -i --http2-prior-knowledge -X GET 'http://127.0.0.1:8642/pets/1001' -H 'accept: application/json'
+      rerun:    add --seed 1 --operation 'getPet'
+
+1 passed, 3 failed, 0 skipped
+```
+
+Look at `createPet`. The first failing body had a twenty-character name and
+an age of 14. The shrunk body has eleven `a`s and an age of 0. The
+description allows twenty characters and the server rejects the eleventh, so
+the report hands you the boundary. In `getPet` the id went from
+9007199254740992 to 1001, the first id whose pet has no name.
+
+The command exits with 1 when a check fails, so it fits a CI step.
+`qcheck openapi --help` lists the options. `--dry-run` prints one generated
+request per operation and sends nothing.
+
+Generated requests are real requests. A `POST` creates things. Run qcheck
+against a test instance.
+
+## What is generated and what is checked
+
+Each operation becomes one property: for every valid request, the response
+passes the checks. A request is built from the operation's parameters (path,
+query, header, form and JSON body). Required parameters are always present.
+Optional ones come and go, and shrink to absent.
+
+Values follow the schema: `type`, `format` (int32, int64, date, date-time,
+uuid, email, byte), `enum`, `minimum` and `maximum` with their exclusive
+forms, `multipleOf` for integers, `minLength`, `maxLength`, `minItems`,
+`maxItems`, `uniqueItems`, `required`, `allOf`, and `$ref` into the same
+file, recursive references included.
+
+| Check | A response fails when |
+|---|---|
+| `transport` | no response came back |
+| `no-server-error` | the status is 500 or above |
+| `documented-status` | the status is not listed and there is no `default` response |
+| `content-type` | a response with a documented schema has a media type outside `produces` |
+| `response-schema` | the JSON body does not conform to the schema documented for the status |
+
+Shrinking keeps to the check that failed first. `--skip-check` turns one
+off.
+
+## HTTP versions
+
+`--http` selects the protocol version: `1.0`, `1.1`, `2`, `3`, or `auto`.
+
+| Value | On the wire |
+|---|---|
+| `auto` | HTTP/2 when a TLS server offers it, otherwise HTTP/1.1 |
+| `1.0`, `1.1` | that version |
+| `2` | HTTP/2 without negotiation: h2c on `http`, `h2` only on `https` |
+| `3` | HTTP/3 over QUIC; needs an `https` URL |
+
+The tests confirm 1.0, 1.1 and 2 against a server that echoes the version it
+saw. HTTP/3 has no local test server yet; it was verified by hand against a
+public HTTP/3 endpoint. HTTP/3 support in the client library is still marked
+unstable, which is why `.cargo/config.toml` sets a build flag.
+
+## Other protocols and languages: adapters
+
+An adapter carries a call to the system under test and returns the reply.
+It is one trait:
+
+```rust
+pub trait Adapter {
+    fn call(&self, operation: &str, input: &Value) -> Result<Value, String>;
+    fn describe(&self) -> String;
+}
+```
+
+`--exec` runs a helper process as the adapter. The helper reads one JSON
+object per line on standard input and writes one reply per line:
+
+```
+-> {"operation": "http", "input": {"method": "GET", "path": "/pets", "query": [], "headers": [], "body": null}}
+<- {"output": {"status": 200, "headers": [["content-type", "application/json"]], "body": "[]"}}
+```
+
+A helper that fails to complete a call answers `{"error": "why"}`. The
+helper decides how a request reaches the code. It can call a handler
+in-process with no network, or translate to a protocol qcheck does not
+speak. `api/examples/pets_helper.py` is a complete one in Python:
+
+```
+qcheck openapi api/examples/pets.yaml --exec 'python3 api/examples/pets_helper.py'
+```
+
+For a protocol with no HTTP shape, implement `Adapter` in Rust, or use
+`ExecAdapter` with your own operation names, and write the property with
+`forall`:
+
+```rust
+let adapter = ExecAdapter::new("./my-helper")?;
+forall(gens::range(0i64, 1000), |n| {
+    let reply = adapter.call("double", &json!(n)).unwrap();
+    reply == json!(n * 2)
+});
+```
+
+## Not covered yet
+
+- OpenAPI 3 descriptions, and `$ref` to other files.
+- `pattern`: generated strings ignore it, and the report says so per
+  operation.
+- File uploads, multipart forms, and request bodies other than JSON and
+  URL-encoded forms. Such operations are reported as skipped.
+- Invalid requests that should be rejected with a 4xx.
+- Sequences of calls checked against a model (state machine testing), and
+  test case statistics. QuviQ QuickCheck and PropEr have both.
+- In the library: floats, `Result`, collections beyond `Vec`, and a test
+  attribute, which the Rust `quickcheck` crate has.
+
+## The property testing library
+
+The `qcheck` crate is the engine underneath, and works on its own for
+testing Rust code.
+
+### A property
 
 A property is a function from one generated value to `bool`. Use a tuple
 when it needs several inputs.
@@ -26,7 +195,7 @@ fn reverse_twice_is_identity() {
 A property may also return `()` and use `assert!`, return a `Result`, or
 return `TestResult` to discard inputs that miss a precondition.
 
-## A failure
+### A failure
 
 `examples/dedup.rs` tests a `dedup` that only compares neighbours. This is
 the captured output of `QC_SEED=1 cargo run --example dedup`:
@@ -47,7 +216,7 @@ Shrinking is greedy. It moves to the first simpler input that still fails
 and stops when no single step does. `[1, 0, 1]` is simpler than `[2, 0, 2]`,
 but reaching it means changing two elements at once, so qcheck stops here.
 
-## Generators
+### Generators
 
 `quickcheck` picks its inputs from the argument's type. When the type says
 too little, build a generator and hand it to `forall`. This follows
@@ -105,7 +274,7 @@ A recursive generator calls itself through `gens::lazy` and spends a budget
 from `gens::sized`, so it ends. `tests/generators.rs` has one for nested
 lists.
 
-## Replaying and tuning
+### Replaying and tuning
 
 Each run picks a fresh seed and prints it on failure. `QC_SEED` replays a
 run and `QC_TESTS` changes the test count (default 100). The same settings
@@ -118,7 +287,7 @@ let outcome = QuickCheck::new().seed(42).tests(1000).run(|x: u32| x < 500);
 `run` returns an `Outcome` to inspect. `check` panics with the report, which
 is the form a `#[test]` wants. `run_with` and `check_with` take a generator.
 
-## Your own types
+### Your own types
 
 Implement `Arbitrary`. `arbitrary` builds a value from the `Gen`, and
 `shrink` lists strictly simpler candidates, simplest first. `shrink` is
@@ -139,20 +308,15 @@ impl Arbitrary for Even {
 Built in: `bool`, the integer types up to 64 bits, `char`, `String`,
 `Vec<T>`, `Option<T>`, and tuples of two or three.
 
-## Not covered yet
-
-Compared with QuviQ QuickCheck and PropEr: test case statistics (`collect`,
-`classify`, `measure`), state machine models, and timeouts. Compared with
-the Rust `quickcheck` crate: floats, `Result`, the standard collections
-beyond `Vec`, properties with several arguments, and a `#[quickcheck]`
-attribute.
-
 ## Running the tests
 
 ```
-cargo test
-scripts/dtest.sh        # same, in a Rust container, for hosts without cargo
+cargo test --workspace
+scripts/dtest.sh --workspace    # same, in a Rust container, for hosts without cargo
 ```
+
+The API tests start the example server on a free port. The helper test
+needs `python3` and is skipped without it.
 
 ## License
 

@@ -154,6 +154,19 @@ impl QuickCheck {
         self
     }
 
+    /// The seed this configuration runs with.
+    pub fn current_seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// The most property evaluations to spend on shrinking one failure
+    /// (default 10,000). Worth lowering when an evaluation is expensive,
+    /// such as a network request.
+    pub fn max_shrinks(mut self, attempts: u32) -> Self {
+        self.max_shrinks = attempts;
+        self
+    }
+
     /// Runs the property on values of an `Arbitrary` type.
     pub fn run<A, R, F>(&self, prop: F) -> Outcome<A>
     where
@@ -248,9 +261,13 @@ impl QuickCheck {
         F: Fn(T) -> R,
     {
         let mut current = tree;
-        let mut steps = 0;
-        'descend: while steps < self.max_shrinks {
+        let (mut steps, mut attempts) = (0, 0);
+        'descend: loop {
             for child in current.children() {
+                if attempts == self.max_shrinks {
+                    break 'descend;
+                }
+                attempts += 1;
                 if let TestResult::Fail(r) = apply(prop, child.value().clone()) {
                     current = child;
                     reason = r;

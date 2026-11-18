@@ -1,0 +1,3 @@
+# reqwest keeps HTTP/3 behind this flag while its API settles.
+[build]
+rustflags = ["--cfg", "reqwest_unstable"]

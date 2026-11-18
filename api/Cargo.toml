@@ -1,0 +1,25 @@
+[package]
+name = "qcheck-api"
+version = "0.1.0"
+edition = "2021"
+description = "QuickCheck for APIs: generated checks over HTTP and other adapters, from OpenAPI 2.0"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "qcheck"
+path = "src/main.rs"
+
+[dependencies]
+qcheck = { path = ".." }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "http2", "http3", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+[dev-dependencies]
+bytes = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
