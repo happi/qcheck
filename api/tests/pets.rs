@@ -206,6 +206,32 @@ fn a_filter_with_a_star_is_a_pattern_for_the_operation_id() {
 }
 
 #[test]
+fn a_numeric_fixture_becomes_text_where_the_description_asks_for_a_string() {
+    let spec = Spec::parse(
+        r#"{"swagger": "2.0", "paths": {"/unlock": {"post": {
+            "parameters": [{"name": "body", "in": "body", "required": true, "schema": {
+                "type": "object", "required": ["pin", "tries"],
+                "properties": {"pin": {"type": "string"}, "tries": {"type": "integer"}}}}],
+            "responses": {"200": {"description": "ok"}}}}}}"#,
+    )
+    .unwrap();
+    let fixtures = vec![
+        ("pin".to_string(), json!(4711)),
+        ("tries".to_string(), json!(3)),
+    ];
+    let requests = spec.operations()[0].requests_with(&fixtures);
+    let mut g = qcheck::Gen::new(1, 10);
+    let bodies: Vec<_> = (0..100).map(|_| requests.sample(&mut g).body).collect();
+    assert!(bodies.contains(&Some(Body::Json(json!({"pin": "4711", "tries": 3})))));
+    for body in bodies {
+        let Some(Body::Json(body)) = body else {
+            panic!("a JSON body")
+        };
+        assert!(body["pin"].is_string() && body["tries"].is_i64(), "{body}");
+    }
+}
+
+#[test]
 fn path_parameters_are_never_dot_segments() {
     let spec = Spec::parse(
         r#"{"swagger": "2.0", "paths": {"/files/{name}": {"get": {

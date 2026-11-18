@@ -494,9 +494,20 @@ impl Operation {
     /// One value per parameter, in parameter order; `None` for an optional
     /// parameter that is left out. `build` turns them into a request.
     pub(crate) fn values(&self, fixtures: &[(String, Value)]) -> Generator<Vec<Option<Value>>> {
-        let known = |name: &str| -> Vec<Value> {
+        // `--set pin=4711` reads as a number. Where the description asks for
+        // a string, the digits are what was meant.
+        let known = |name: &str, schema: &Value| -> Vec<Value> {
+            let schema = schema::resolve(&self.root, schema);
+            let wants_text = schema.get("type").and_then(Value::as_str) == Some("string");
             let matching = fixtures.iter().filter(|(n, _)| n == name);
-            matching.map(|(_, value)| value.clone()).collect()
+            matching
+                .map(|(_, value)| match value {
+                    Value::Number(_) | Value::Bool(_) if wants_text => {
+                        Value::String(value.to_string())
+                    }
+                    value => value.clone(),
+                })
+                .collect()
         };
 
         let mut values: Generator<Vec<Option<Value>>> = gens::constant(Vec::new());
@@ -527,8 +538,8 @@ impl Operation {
             if matches!(parameter.location.as_str(), "body" | "form") {
                 // A fixture named after a property of the body goes there.
                 let properties = resolved.get("properties").and_then(Value::as_object);
-                for name in properties.into_iter().flat_map(|p| p.keys()) {
-                    let fixed = known(name);
+                for (name, property) in properties.into_iter().flatten() {
+                    let fixed = known(name, property);
                     if fixed.is_empty() {
                         continue;
                     }
@@ -542,7 +553,7 @@ impl Operation {
                     });
                 }
             } else {
-                let fixed = known(&parameter.name);
+                let fixed = known(&parameter.name, &parameter.schema);
                 if !fixed.is_empty() {
                     // The generated value comes first, so shrinking tries one
                     // in place of a fixture. A fixture itself does not
