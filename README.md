@@ -44,7 +44,7 @@ Captured output:
 ```
 api/examples/pets.yaml: 4 operations, 100 requests each, http://127.0.0.1:8642 over HTTP/2, seed 1
 
-ok    GET /health (health): 100 requests
+ok    GET /health (health): 100 requests (200 x100)
 FAIL  GET /pets (listPets): after 1 passing request
       check:    no-server-error
       reason:   server error: status 500
@@ -75,6 +75,11 @@ FAIL  GET /pets/{id} (getPet): after 3 passing requests
 1 passed, 3 failed, 0 skipped
 ```
 
+A passing operation lists the statuses it saw. When none of them is a 2xx,
+qcheck adds a note: every request was rejected, so only the error path was
+checked. That usually means the operation needs existing data or
+credentials the run did not have.
+
 Look at `createPet`. The first failing body had a twenty-character name and
 an age of 14. The shrunk body has eleven `a`s and an age of 0. The
 description allows twenty characters and the server rejects the eleventh, so
@@ -94,8 +99,13 @@ after a `#`. `--exclude-from` skips them and prints the reason, so the rest
 of the API is checked and the list of open findings stays in view:
 
 ```
-createPet   # 422 for names over ten characters, not documented
+createPet                      # 422 for names over ten characters, not documented
+getPet @response-schema        # imported pets have no name; other checks still apply
 ```
+
+A line with `@check` leaves out only that check for the operation. Use it
+when one check has a known failure and the others, such as the one for
+server errors, should keep running.
 
 The command exits with 1 when a check fails, so it fits a CI step.
 `qcheck openapi --help` lists the options. `--dry-run` prints one generated
@@ -110,6 +120,15 @@ Each operation becomes one property: for every valid request, the response
 passes the checks. A request is built from the operation's parameters (path,
 query, header, form and JSON body). Required parameters are always present.
 Optional ones come and go, and shrink to absent.
+
+One value in four is taken from the description's own `example`,
+`examples` or `default` when it has them and they fit the schema. Requests
+are independent, so a documented example is often the only id or name that
+exists on the server, and with it the success path gets checked too.
+
+`--set name=value` supplies a value you know exists, such as the id of a
+record the test instance was seeded with. Half the requests that have a
+parameter or body property of that name then use it.
 
 Values follow the schema: `type`, `format` (int32, int64, date, date-time,
 uuid, email, byte), `enum`, `minimum` and `maximum` with their exclusive

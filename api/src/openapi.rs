@@ -290,12 +290,19 @@ impl Operation {
             }
             // In 2.0 only a body has a schema; the other parameters carry
             // the schema keywords themselves. In 3.x each has a schema.
-            let schema = match (v3, location.as_str()) {
+            let mut schema = match (v3, location.as_str()) {
                 (true, _) | (false, "body") => {
                     parameter.get("schema").cloned().unwrap_or(json!({}))
                 }
                 (false, _) => parameter.clone(),
             };
+            // OpenAPI 3 lets the parameter carry the example, beside its
+            // schema. The generator looks for it on the schema.
+            if let (true, Some(example), Some(map)) =
+                (v3, parameter.get("example"), schema.as_object_mut())
+            {
+                map.entry("example").or_insert(example.clone());
+            }
             let collection_format = match (v3, field("collectionFormat"), field("style")) {
                 (false, "", _) => "csv",
                 (false, format, _) => format,
@@ -454,14 +461,30 @@ impl Operation {
     /// A generator of requests the description calls valid. Optional
     /// parameters come and go, and shrink to absent.
     pub fn requests(&self) -> Generator<HttpRequest> {
+        self.requests_with(&[])
+    }
+
+    /// Like `requests`, with values known to exist on the server. A
+    /// fixture is a parameter or body property name and a value; half the
+    /// requests that have that parameter use it. Requests are independent,
+    /// so without one an id-based route is only ever asked for ids that
+    /// do not exist.
+    pub fn requests_with(&self, fixtures: &[(String, Value)]) -> Generator<HttpRequest> {
+        let known = |name: &str| -> Vec<Value> {
+            let matching = fixtures.iter().filter(|(n, _)| n == name);
+            matching.map(|(_, value)| value.clone()).collect()
+        };
+
         let mut values: Generator<Vec<Option<Value>>> = gens::constant(Vec::new());
         for parameter in &self.parameters {
             let resolved = schema::resolve(&self.root, &parameter.schema);
             let plain_string = resolved.get("type").and_then(Value::as_str) == Some("string")
                 && resolved.get("enum").is_none()
                 && resolved.get("format").is_none();
-            let value = if parameter.location == "path" && plain_string {
-                // An empty segment or a slash would address another path.
+            let mut value = if parameter.location == "path" && plain_string {
+                // An empty segment or a slash would address another path,
+                // and so would `.` and `..`, which every URL parser folds
+                // away before the request is sent.
                 let field = |name| {
                     resolved
                         .get(name)
@@ -470,10 +493,40 @@ impl Operation {
                 };
                 let min = field("minLength").unwrap_or(1).max(1);
                 let max = field("maxLength").unwrap_or(min + 12);
-                schema::text(schema::PATH_TEXT, min, max).map(Value::String)
+                schema::text(schema::PATH_TEXT, min, max)
+                    .such_that(|segment| segment != "." && segment != "..")
+                    .map(Value::String)
             } else {
                 schema::generator(&self.root, &parameter.schema)
             };
+
+            if matches!(parameter.location.as_str(), "body" | "form") {
+                // A fixture named after a property of the body goes there.
+                let properties = resolved.get("properties").and_then(Value::as_object);
+                for name in properties.into_iter().flat_map(|p| p.keys()) {
+                    let fixed = known(name);
+                    if fixed.is_empty() {
+                        continue;
+                    }
+                    let name = name.clone();
+                    let choice = gens::option(gens::elements(fixed));
+                    value = gens::zip(value, choice).map(move |(mut body, fixed)| {
+                        if let (Some(fixed), Some(map)) = (fixed, body.as_object_mut()) {
+                            map.insert(name.clone(), fixed);
+                        }
+                        body
+                    });
+                }
+            } else {
+                let fixed = known(&parameter.name);
+                if !fixed.is_empty() {
+                    // The generated value comes first, so shrinking tries one
+                    // in place of a fixture. A fixture itself does not
+                    // shrink: it is a value that exists, not a size.
+                    value = gens::frequency(vec![(1, value), (1, gens::elements(fixed))]);
+                }
+            }
+
             let value = if parameter.required {
                 value.map(Some)
             } else {
@@ -665,6 +718,9 @@ pub struct Options {
     /// The most requests to spend shrinking one failure.
     pub max_shrinks: u32,
     pub checks: Vec<Check>,
+    /// Values known to exist on the server, by parameter or body property
+    /// name. See [`Operation::requests_with`].
+    pub fixtures: Vec<(String, Value)>,
 }
 
 impl Default for Options {
@@ -674,6 +730,7 @@ impl Default for Options {
             seed: None,
             max_shrinks: 500,
             checks: Check::ALL.to_vec(),
+            fixtures: Vec::new(),
         }
     }
 }
@@ -694,7 +751,11 @@ pub struct Failure {
 
 #[derive(Clone, Debug)]
 pub enum Verdict {
-    Passed { tests: u32 },
+    Passed {
+        tests: u32,
+        /// How many responses had each status, in status order.
+        statuses: Vec<(u16, u32)>,
+    },
     Failed(Box<Failure>),
     Skipped(String),
 }
@@ -718,6 +779,10 @@ pub fn check_operation(operation: &Operation, adapter: &dyn Adapter, options: &O
     // simpler form of this failure.
     let pinned: RefCell<Option<Check>> = RefCell::new(None);
 
+    // A check that passes on nothing but rejections says little, so the
+    // statuses seen are part of the result.
+    let statuses: RefCell<std::collections::BTreeMap<u16, u32>> = RefCell::default();
+
     let property = |request: HttpRequest| {
         let (violation, response) = match send(adapter, &request) {
             Err(message) if options.checks.contains(&Check::Transport) => {
@@ -725,10 +790,13 @@ pub fn check_operation(operation: &Operation, adapter: &dyn Adapter, options: &O
                 (Violation { check, message }, None)
             }
             Err(_) => return TestResult::Discard,
-            Ok(response) => match operation.check(&response, &options.checks) {
-                Ok(()) => return TestResult::Pass,
-                Err(violation) => (violation, Some(response)),
-            },
+            Ok(response) => {
+                *statuses.borrow_mut().entry(response.status).or_default() += 1;
+                match operation.check(&response, &options.checks) {
+                    Ok(()) => return TestResult::Pass,
+                    Err(violation) => (violation, Some(response)),
+                }
+            }
         };
         let target = *pinned.borrow_mut().get_or_insert(violation.check);
         if violation.check != target {
@@ -745,8 +813,11 @@ pub fn check_operation(operation: &Operation, adapter: &dyn Adapter, options: &O
     if let Some(seed) = options.seed {
         config = config.seed(seed);
     }
-    match config.run_with(&operation.requests(), property) {
-        Outcome::Passed { tests } => Verdict::Passed { tests },
+    match config.run_with(&operation.requests_with(&options.fixtures), property) {
+        Outcome::Passed { tests } => Verdict::Passed {
+            tests,
+            statuses: statuses.into_inner().into_iter().collect(),
+        },
         Outcome::GaveUp { .. } => Verdict::Skipped("no request completed".to_string()),
         Outcome::Failed(failure) => {
             let (violation, response) = last.into_inner().expect("a failure was recorded");

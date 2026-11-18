@@ -6,6 +6,17 @@ use qcheck_api::{Adapter, ExecAdapter, HttpAdapter, HttpOptions, HttpRequest, Ht
 use std::process::ExitCode;
 use std::time::Duration;
 
+/// Prints a line, and exits quietly when the reader has gone away, as it
+/// has when the output is piped to `head`.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        if writeln!(std::io::stdout(), $($arg)*).is_err() {
+            std::process::exit(0);
+        }
+    }};
+}
+
 const USAGE: &str = "\
 qcheck: QuickCheck for APIs
 
@@ -34,6 +45,9 @@ Run:
   --tests <n>           Requests per operation. Default: 100.
   --seed <n>            Replay a run.
   --max-shrinks <n>     Requests spent shrinking one failure. Default: 500.
+  --set <name=value>    A value known to exist on the server, for the
+                        parameter or body property of that name. Half the
+                        requests use it. May be repeated.
   --operation <text>    Only operations with this operationId, or with this
                         text in 'METHOD /path'. May be repeated.
   --exclude <text>      Leave out operations that match, same matching.
@@ -42,6 +56,8 @@ Run:
                         'text  # reason'. The reason is printed with the
                         skipped operation, which keeps known failures
                         visible while the rest of the API is checked.
+                        'text @check,check  # reason' leaves out only the
+                        named checks for the matching operations.
   --skip-check <name>   Disable a check: transport, no-server-error,
                         documented-status, content-type, response-schema.
   --dry-run             Print one generated request per operation and send
@@ -60,6 +76,9 @@ struct Args {
     operations: Vec<String>,
     /// A filter and the reason for it.
     excluded: Vec<(String, String)>,
+    /// A filter, the checks to leave out for the operations it matches,
+    /// and the reason.
+    relaxed: Vec<(String, Vec<Check>, String)>,
     dry_run: bool,
 }
 
@@ -72,6 +91,7 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         options: Options::default(),
         operations: Vec::new(),
         excluded: Vec::new(),
+        relaxed: Vec::new(),
         dry_run: false,
     };
     let mut rest = args.iter();
@@ -105,6 +125,16 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--tests" => parsed.options.tests = number(value("a count")?)? as u32,
             "--seed" => parsed.options.seed = Some(number(value("a seed")?)?),
             "--max-shrinks" => parsed.options.max_shrinks = number(value("a count")?)? as u32,
+            "--set" => {
+                let text = value("name=value")?;
+                let (name, fixed) = text
+                    .split_once('=')
+                    .ok_or(format!("--set: {text:?} is not name=value"))?;
+                // A value that reads as JSON is sent as that type.
+                let fixed = serde_json::from_str(fixed)
+                    .unwrap_or(serde_json::Value::String(fixed.to_string()));
+                parsed.options.fixtures.push((name.to_string(), fixed));
+            }
             "--operation" => parsed.operations.push(value("a filter")?),
             "--exclude" => parsed
                 .excluded
@@ -113,11 +143,27 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 let path = value("a file")?;
                 let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
                 for line in text.lines() {
-                    let (filter, reason) = line.split_once('#').unwrap_or((line, "excluded"));
-                    if !filter.trim().is_empty() {
-                        parsed
-                            .excluded
-                            .push((filter.trim().to_string(), reason.trim().to_string()));
+                    let (entry, reason) = line.split_once('#').unwrap_or((line, "excluded"));
+                    let (entry, reason) = (entry.trim(), reason.trim().to_string());
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    // `filter @check,check` leaves out only those checks.
+                    match entry.split_once(" @") {
+                        None => parsed.excluded.push((entry.to_string(), reason)),
+                        Some((filter, names)) => {
+                            let mut checks = Vec::new();
+                            for name in names.split(',') {
+                                let name = name.trim();
+                                checks.push(
+                                    Check::parse(name)
+                                        .ok_or(format!("{path}: no check named {name:?}"))?,
+                                );
+                            }
+                            parsed
+                                .relaxed
+                                .push((filter.trim().to_string(), checks, reason));
+                        }
                     }
                 }
             }
@@ -144,7 +190,12 @@ fn quote(text: &str) -> String {
 }
 
 /// The request as a curl command, so a failure can be replayed by hand.
-fn curl(request: &HttpRequest, base_url: &str, version: HttpVersion) -> String {
+fn curl(
+    request: &HttpRequest,
+    base_url: &str,
+    version: HttpVersion,
+    extra_headers: &[(String, String)],
+) -> String {
     let mut parts = vec!["curl -i".to_string()];
     parts.extend(version.curl_flag().map(str::to_string));
     parts.push(format!("-X {}", request.method));
@@ -153,6 +204,11 @@ fn curl(request: &HttpRequest, base_url: &str, version: HttpVersion) -> String {
         base_url.trim_end_matches('/'),
         request.target()
     )));
+    // Headers from the command line are often credentials, and reports end
+    // up in CI logs, so only their names are shown.
+    for (name, _) in extra_headers {
+        parts.push(format!("-H {}", quote(&format!("{name}: ..."))));
+    }
     for (name, value) in &request.headers {
         parts.push(format!("-H {}", quote(&format!("{name}: {value}"))));
     }
@@ -171,13 +227,13 @@ fn clip(text: &str, limit: usize) -> String {
 }
 
 fn print_request(label: &str, request: &HttpRequest, note: &str) {
-    println!(
+    say!(
         "      {label:<9} {} {}{note}",
         request.method,
         request.target()
     );
     if let Some(body) = request.body_text() {
-        println!("      {:<9} {}", "", clip(&body, 300));
+        say!("      {:<9} {}", "", clip(&body, 300));
     }
 }
 
@@ -195,8 +251,8 @@ fn print_failure(
     base_url: Option<&str>,
     seed: u64,
 ) {
-    println!("      check:    {}", failure.violation.check.name());
-    println!("      reason:   {}", clip(&failure.violation.message, 400));
+    say!("      check:    {}", failure.violation.check.name());
+    say!("      reason:   {}", clip(&failure.violation.message, 400));
     print_request("request:", &failure.request, "");
     if let Some(response) = &failure.response {
         let line = format!(
@@ -205,23 +261,28 @@ fn print_failure(
             response.status,
             clip(&response.body, 200)
         );
-        println!("      response: {}", line.trim_start());
+        say!("      response: {}", line.trim_start());
     }
     if failure.shrinks > 0 {
         let note = format!("  (before {})", plural(failure.shrinks, "shrink"));
         print_request("original:", &failure.original, &note);
     }
     if let Some(base_url) = base_url {
-        println!(
+        say!(
             "      replay:   {}",
-            curl(&failure.request, base_url, args.http.version)
+            curl(
+                &failure.request,
+                base_url,
+                args.http.version,
+                &args.http.headers
+            )
         );
     }
     let filter = operation
         .operation_id
         .clone()
         .unwrap_or(format!("{} {}", operation.method, operation.path));
-    println!(
+    say!(
         "      rerun:    add --seed {seed} --operation {}",
         quote(&filter)
     );
@@ -249,10 +310,14 @@ fn run(args: &Args) -> Result<bool, String> {
     if args.dry_run {
         let mut g = Gen::new(seed, 30);
         for operation in &operations {
-            println!("{operation}");
-            match &operation.unsupported {
-                Some(reason) => println!("      skipped: {reason}"),
-                None => print_request("sample:", &operation.requests().sample(&mut g), ""),
+            say!("{operation}");
+            let excluded = args.excluded.iter().find(|(f, _)| operation.matches(f));
+            match (&operation.unsupported, excluded) {
+                (Some(reason), _) | (None, Some((_, reason))) => say!("      skipped: {reason}"),
+                (None, None) => {
+                    let requests = operation.requests_with(&args.options.fixtures);
+                    print_request("sample:", &requests.sample(&mut g), "")
+                }
             }
         }
         return Ok(true);
@@ -273,7 +338,7 @@ fn run(args: &Args) -> Result<bool, String> {
         (None, None) => unreachable!("a base URL is required without --exec"),
     };
 
-    println!(
+    say!(
         "{}: {}, {} each, {}, seed {seed}\n",
         args.spec,
         plural(operations.len() as u32, "operation"),
@@ -285,32 +350,60 @@ fn run(args: &Args) -> Result<bool, String> {
     for operation in &operations {
         if let Some((_, reason)) = args.excluded.iter().find(|(f, _)| operation.matches(f)) {
             skipped += 1;
-            println!("skip  {operation}: {reason}");
+            say!("skip  {operation}: {reason}");
             continue;
         }
-        match check_operation(operation, adapter.as_ref(), &options) {
-            Verdict::Passed { tests } => {
+        let mut options = options.clone();
+        let mut relaxations = Vec::new();
+        for (filter, checks, reason) in &args.relaxed {
+            if operation.matches(filter) {
+                options.checks.retain(|check| !checks.contains(check));
+                let names: Vec<&str> = checks.iter().map(|check| check.name()).collect();
+                relaxations.push(format!("{} not checked: {reason}", names.join(", ")));
+            }
+        }
+        let verdict = check_operation(operation, adapter.as_ref(), &options);
+        match verdict {
+            Verdict::Passed { tests, statuses } => {
                 passed += 1;
-                println!("ok    {operation}: {}", plural(tests, "request"));
+                let seen: Vec<String> = statuses
+                    .iter()
+                    .map(|(status, count)| format!("{status} x{count}"))
+                    .collect();
+                say!(
+                    "ok    {operation}: {} ({})",
+                    plural(tests, "request"),
+                    seen.join(", ")
+                );
+                // Passing on rejections alone checks the error path only.
+                if !statuses
+                    .iter()
+                    .any(|(status, _)| (200..300).contains(status))
+                {
+                    say!("      note: no request got a 2xx response, so the success path was not checked");
+                }
             }
             Verdict::Skipped(reason) => {
                 skipped += 1;
-                println!("skip  {operation}: {reason}");
+                say!("skip  {operation}: {reason}");
             }
             Verdict::Failed(failure) => {
                 failed += 1;
-                println!(
+                say!(
                     "FAIL  {operation}: after {}",
                     plural(failure.passed, "passing request")
                 );
                 print_failure(&failure, operation, args, base_url.as_deref(), seed);
             }
         }
+        for note in &relaxations {
+            say!("      note: {note}");
+        }
         for warning in &operation.warnings {
-            println!("      note: {warning}");
+            say!("      note: {warning}");
         }
     }
-    println!("\n{passed} passed, {failed} failed, {skipped} skipped");
+    say!("\n{passed} passed, {failed} failed, {skipped} skipped");
     Ok(failed == 0)
 }
 
@@ -319,7 +412,7 @@ fn main() -> ExitCode {
     match args.first().map(String::as_str) {
         Some("openapi") => {}
         Some("-h" | "--help" | "help") | None => {
-            print!("{USAGE}");
+            say!("{}", USAGE.trim_end());
             return ExitCode::SUCCESS;
         }
         Some(other) => {
@@ -328,7 +421,7 @@ fn main() -> ExitCode {
         }
     }
     if args.iter().any(|a| a == "-h" || a == "--help") {
-        print!("{USAGE}");
+        say!("{}", USAGE.trim_end());
         return ExitCode::SUCCESS;
     }
     match parse_args(&args[1..]).and_then(|args| run(&args)) {

@@ -143,7 +143,16 @@ impl HttpAdapter {
             builder = builder.body(request.body_text().unwrap_or_default());
         }
 
-        let response = builder.send().map_err(describe_error)?;
+        // A server may close a kept-alive connection, typically after it
+        // answered 500. The next request then fails on the stale
+        // connection, which says nothing about that request, so it gets
+        // one more try on a fresh one. A timeout is not retried.
+        let again = builder.try_clone();
+        let response = match (builder.send(), again) {
+            (Err(error), Some(again)) if !error.is_timeout() => again.send(),
+            (result, _) => result,
+        }
+        .map_err(describe_error)?;
         let status = response.status().as_u16();
         let version = format!("{:?}", response.version());
         let headers = response

@@ -36,6 +36,20 @@ fn failure(spec: &Spec, adapter: &dyn Adapter, operation: &str) -> Failure {
 }
 
 #[test]
+fn a_passing_operation_reports_the_statuses_it_saw() {
+    let reports = check_spec(
+        &spec(),
+        &adapter(HttpVersion::Http11),
+        &options(),
+        Some("health"),
+    );
+    match &reports[0].verdict {
+        Verdict::Passed { statuses, .. } => assert_eq!(statuses, &[(200, 100)]),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn a_correct_operation_passes() {
     let reports = check_spec(
         &spec(),
@@ -43,7 +57,10 @@ fn a_correct_operation_passes() {
         &options(),
         Some("health"),
     );
-    assert!(matches!(reports[0].verdict, Verdict::Passed { tests: 100 }));
+    assert!(matches!(
+        reports[0].verdict,
+        Verdict::Passed { tests: 100, .. }
+    ));
 }
 
 #[test]
@@ -103,10 +120,58 @@ fn an_openapi_3_description_finds_the_same_bugs() {
     for operation in ["health", "createPet"] {
         let reports = check_spec(&spec, &adapter, &options(), Some(operation));
         assert!(
-            matches!(reports[0].verdict, Verdict::Passed { tests: 100 }),
+            matches!(reports[0].verdict, Verdict::Passed { tests: 100, .. }),
             "{operation}"
         );
     }
+}
+
+/// With `id` pinned to 2000 half the time, getPet meets the unnamed pet
+/// on a known id. A fixture does not shrink, so the report keeps either
+/// that id or the boundary a generated id shrank to.
+#[test]
+fn a_fixture_value_reaches_the_path_that_needs_existing_data() {
+    let spec = spec();
+    let operation = spec
+        .operations()
+        .into_iter()
+        .find(|o| o.matches("getPet"))
+        .unwrap();
+    let mut g = qcheck::Gen::new(1, 10);
+    let fixtures = vec![("id".to_string(), json!(2000))];
+    let requests = operation.requests_with(&fixtures);
+    let pinned = (0..200)
+        .filter(|_| requests.sample(&mut g).path == "/pets/2000")
+        .count();
+    assert!((60..140).contains(&pinned), "{pinned} of 200");
+
+    let options = Options {
+        fixtures,
+        ..options()
+    };
+    match check_operation(&operation, &adapter(HttpVersion::Http11), &options) {
+        Verdict::Failed(failure) => {
+            let path = failure.request.path.as_str();
+            assert!(matches!(path, "/pets/2000" | "/pets/1001"), "{path}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn path_parameters_are_never_dot_segments() {
+    let spec = Spec::parse(
+        r#"{"swagger": "2.0", "paths": {"/files/{name}": {"get": {
+            "parameters": [{"name": "name", "in": "path", "required": true, "type": "string", "maxLength": 2}],
+            "responses": {"200": {"description": "ok"}}}}}}"#,
+    )
+    .unwrap();
+    let requests = spec.operations()[0].requests();
+    qcheck::QuickCheck::new()
+        .tests(2000)
+        .check_with(&requests, |request| {
+            !matches!(request.path.as_str(), "/files/." | "/files/..")
+        });
 }
 
 #[test]
@@ -206,7 +271,10 @@ fn a_helper_process_serves_the_same_checks() {
     let spec = spec();
 
     let reports = check_spec(&spec, &adapter, &options(), Some("health"));
-    assert!(matches!(reports[0].verdict, Verdict::Passed { tests: 100 }));
+    assert!(matches!(
+        reports[0].verdict,
+        Verdict::Passed { tests: 100, .. }
+    ));
 
     let failure = failure(&spec, &adapter, "createPet");
     assert_eq!(failure.violation.check, Check::ResponseSchema);

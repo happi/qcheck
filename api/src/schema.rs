@@ -121,6 +121,31 @@ fn generator_at(root: &Rc<Value>, schema: &Value, depth: usize) -> Generator<Val
     }
 
     let schema = flatten(root, schema);
+    let generated = described(root, &schema, depth);
+
+    // Values the description itself offers. They are often the only ones
+    // that reach the success path (an id that exists, a known name), so
+    // one request in four uses one. Generated values come first, which
+    // keeps shrinking on them.
+    let mut offered: Vec<Value> = Vec::new();
+    offered.extend(schema.get("example").cloned());
+    offered.extend(schema.get("default").cloned());
+    offered.extend(
+        schema
+            .get("examples")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .cloned(),
+    );
+    offered.retain(|value| validate(root, &schema, value).is_empty());
+    if offered.is_empty() || schema.get("const").is_some() || schema.get("enum").is_some() {
+        return generated;
+    }
+    gens::frequency(vec![(3, generated), (1, gens::elements(offered))])
+}
+
+fn described(root: &Rc<Value>, schema: &Value, depth: usize) -> Generator<Value> {
     if let Some(values) = schema.get("enum").and_then(Value::as_array) {
         if !values.is_empty() {
             return gens::elements(values.clone());
@@ -139,17 +164,17 @@ fn generator_at(root: &Rc<Value>, schema: &Value, depth: usize) -> Generator<Val
         }
     }
 
-    let mut choices: Vec<Generator<Value>> = types(&schema)
+    let mut choices: Vec<Generator<Value>> = types(schema)
         .into_iter()
         .filter(|name| *name != "null")
-        .map(|name| typed(root, &schema, name, depth))
+        .map(|name| typed(root, schema, name, depth))
         .collect();
     let value = match choices.len() {
         0 => return gens::constant(Value::Null),
         1 => choices.remove(0),
         _ => gens::one_of(choices),
     };
-    if nullable(&schema) {
+    if nullable(schema) {
         // The value comes first, so a nullable field shrinks to a simple
         // value and reports null only when null is what fails.
         return gens::frequency(vec![(4, value), (1, gens::constant(Value::Null))]);
@@ -565,7 +590,7 @@ mod tests {
                     "type": "object",
                     "required": ["label"],
                     "properties": {
-                        "label": {"type": "string"},
+                        "label": {"type": "string", "example": "root", "examples": ["leaf", 7]},
                         "children": {"type": "array", "items": {"$ref": "#/definitions/Tree"}}
                     }
                 },
@@ -634,6 +659,24 @@ mod tests {
         );
         let fine = json!({"object": "event", "note": null, "size": 9, "payload": "none"});
         assert_eq!(validate(&root, &event, &fine), Vec::<String>::new());
+    }
+
+    #[test]
+    fn documented_examples_are_used_when_they_fit_the_schema() {
+        let root = root();
+        let label = json!({"type": "string", "example": "root", "examples": ["leaf", 7]});
+        let mut g = qcheck::Gen::new(1, 10);
+        let values: Vec<Value> = (0..400)
+            .map(|_| generator(&root, &label).sample(&mut g))
+            .collect();
+        assert!(values.contains(&json!("root")) && values.contains(&json!("leaf")));
+        // The example 7 breaks the schema, so it is never sent.
+        assert!(values.iter().all(Value::is_string));
+        let used = values
+            .iter()
+            .filter(|v| *v == "root" || *v == "leaf")
+            .count();
+        assert!((50..150).contains(&used), "{used} of 400");
     }
 
     #[test]
