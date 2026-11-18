@@ -65,6 +65,13 @@ pub fn route(method: &Method, path: &str, query: &str, body: &[u8]) -> (u16, Val
             (201, stored)
         }
 
+        // Not part of the described API. It returns what arrived, so a test
+        // can compare a request with what the server saw.
+        (_, ["echo"]) => (
+            200,
+            json!({"method": method.as_str(), "query": query, "body": String::from_utf8_lossy(body)}),
+        ),
+
         _ => (404, json!({"error": "no such route"})),
     }
 }

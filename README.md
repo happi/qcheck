@@ -13,6 +13,20 @@ The repository holds two crates. `qcheck` is the property testing library,
 with no dependencies. `qcheck-api` in `api/` adds the adapters, the OpenAPI
 support, and the `qcheck` command.
 
+## Install
+
+Each release has a static binary for x86_64 Linux. It has no dependencies,
+so the same two lines work on a laptop, in a container, and in CI:
+
+```
+curl -fsSL -o qcheck https://github.com/happi/qcheck/releases/latest/download/qcheck-x86_64-linux
+chmod +x qcheck
+```
+
+Pin a version in CI by replacing `latest/download` with `download/v0.1.0`.
+From source: `cargo build --release -p qcheck-api --bin qcheck` in a
+checkout, which picks up the build flag in `.cargo/config.toml`.
+
 ## Checking an API from its description
 
 `api/examples/buggy_pets.rs` is a small pet API with three planted bugs, and
@@ -66,6 +80,14 @@ an age of 14. The shrunk body has eleven `a`s and an age of 0. The
 description allows twenty characters and the server rejects the eleventh, so
 the report hands you the boundary. In `getPet` the id went from
 9007199254740992 to 1001, the first id whose pet has no name.
+
+The description can also be a URL. Many frameworks serve one, FastAPI at
+`/openapi.json`, and then the API is assumed to run where the description
+came from:
+
+```
+qcheck openapi http://127.0.0.1:8000/openapi.json
+```
 
 The command exits with 1 when a check fails, so it fits a CI step.
 `qcheck openapi --help` lists the options. `--dry-run` prints one generated
@@ -324,6 +346,10 @@ scripts/dtest.sh --workspace    # same, in a Rust container, for hosts without c
 
 The API tests start the example server on a free port. The helper test
 needs `python3` and is skipped without it.
+
+`api/tests/dogfood.rs` is qcheck testing itself: percent-encoding round
+trips, a request arrives at the server as written on HTTP/1.0, 1.1 and 2,
+and no description, however malformed, makes the reader panic.
 
 ## License
 

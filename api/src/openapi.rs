@@ -97,9 +97,18 @@ impl Spec {
         })
     }
 
-    pub fn load(path: &str) -> Result<Spec, String> {
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-        Spec::parse(&text).map_err(|e| format!("{path}: {e}"))
+    /// Loads a description from a file, or from an `http(s)` URL such as
+    /// the `/openapi.json` that many frameworks serve.
+    pub fn load(location: &str) -> Result<Spec, String> {
+        let text = if is_url(location) {
+            reqwest::blocking::get(location)
+                .and_then(|response| response.error_for_status())
+                .and_then(|response| response.text())
+                .map_err(|e| format!("{location}: {e}"))?
+        } else {
+            std::fs::read_to_string(location).map_err(|e| format!("{location}: {e}"))?
+        };
+        Spec::parse(&text).map_err(|e| format!("{location}: {e}"))
     }
 
     /// The base URL the description itself names, when it names one:
@@ -219,6 +228,21 @@ fn mentions_pattern(root: &Value, schema: &Value, depth: usize) -> bool {
             "allOf" | "oneOf" | "anyOf" => value.as_array().is_some_and(|a| a.iter().any(deeper)),
             _ => false,
         })
+}
+
+fn is_url(location: &str) -> bool {
+    location.starts_with("http://") || location.starts_with("https://")
+}
+
+/// The scheme and authority of a URL: where a description fetched over
+/// HTTP was served from, which is where its API most likely runs.
+pub fn origin(location: &str) -> Option<String> {
+    if !is_url(location) {
+        return None;
+    }
+    let (scheme, rest) = location.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    Some(format!("{scheme}://{authority}"))
 }
 
 fn is_json(media: &str) -> bool {

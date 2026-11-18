@@ -37,14 +37,20 @@ pub fn resolve<'a>(root: &'a Value, mut schema: &'a Value) -> &'a Value {
 /// Folds `allOf` into one schema: properties and required lists are joined,
 /// and other keywords are taken from the first schema that has them.
 fn flatten(root: &Value, schema: &Value) -> Value {
+    flatten_at(root, schema, 0)
+}
+
+fn flatten_at(root: &Value, schema: &Value, depth: usize) -> Value {
     let schema = resolve(root, schema);
-    let Some(parts) = schema.get("allOf").and_then(Value::as_array) else {
-        return schema.clone();
+    let parts = match schema.get("allOf").and_then(Value::as_array) {
+        // A schema whose allOf leads back to itself has no finite merge.
+        Some(parts) if depth <= MAX_REF_DEPTH => parts,
+        _ => return schema.clone(),
     };
     let mut merged = schema.as_object().cloned().unwrap_or_default();
     merged.remove("allOf");
     for part in parts {
-        let Value::Object(part) = flatten(root, part) else {
+        let Value::Object(part) = flatten_at(root, part, depth + 1) else {
             continue;
         };
         for (key, value) in part {

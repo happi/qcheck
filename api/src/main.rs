@@ -12,13 +12,16 @@ qcheck: QuickCheck for APIs
 Usage:
   qcheck openapi <spec> [options]
 
+<spec> is a file or an http(s) URL, such as a service's /openapi.json.
+
 Reads an OpenAPI description (2.0, 3.0 or 3.1; JSON or YAML), generates valid requests
 for each operation, and checks every response against the description.
 A failing request is shrunk to the smallest one that still fails.
 
 Target:
-  --base-url <url>      Where the API runs. Default: host and basePath from
-                        the description.
+  --base-url <url>      Where the API runs. Default: the server named in the
+                        description, else the host the description was
+                        fetched from.
   --http <version>      auto, 1.0, 1.1, 2 or 3. Default: auto. `2` skips
                         negotiation (h2c on plain http). `3` needs https.
   --exec <command>      Send requests to a helper process instead of over
