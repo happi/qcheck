@@ -1,0 +1,30 @@
+name: qcheck checks
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      # The command against its own example server: the three planted bugs
+      # must be found, so the exit status must be 1.
+      - name: qcheck finds the planted bugs
+        run: |
+          cargo build -p qcheck-api --example buggy_pets --bin qcheck
+          ./target/debug/examples/buggy_pets &
+          sleep 1
+          status=0
+          ./target/debug/qcheck openapi api/examples/pets.yaml \
+              --base-url http://127.0.0.1:8642 --seed 1 || status=$?
+          test "$status" -eq 1

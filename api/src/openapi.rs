@@ -1,4 +1,5 @@
-//! Checks generated from an OpenAPI 2.0 (Swagger) description.
+//! Checks generated from an OpenAPI description, version 2.0 (Swagger),
+//! 3.0 or 3.1.
 //!
 //! Each operation in the description becomes one property: for every valid
 //! request, the response passes the checks in [`Check`].
@@ -23,7 +24,8 @@ pub enum Check {
     /// The status is listed for the operation, or the operation has a
     /// `default` response.
     DocumentedStatus,
-    /// A response with a documented schema has a media type from `produces`.
+    /// The media type of the body is one the description lists for the
+    /// status.
     ContentType,
     /// The body conforms to the schema documented for the status.
     ResponseSchema,
@@ -62,6 +64,8 @@ pub struct Violation {
 /// A parsed description.
 pub struct Spec {
     root: Rc<Value>,
+    /// True for OpenAPI 3.x, false for 2.0.
+    v3: bool,
 }
 
 impl Spec {
@@ -71,26 +75,25 @@ impl Spec {
             Ok(value) => value,
             Err(_) => serde_yaml::from_str(text).map_err(|e| format!("not JSON or YAML: {e}"))?,
         };
-        match root.get("swagger").and_then(Value::as_str) {
-            Some("2.0") => {}
-            Some(other) => {
+        let field = |name| root.get(name).and_then(Value::as_str);
+        let v3 = match (field("swagger"), field("openapi")) {
+            (Some("2.0"), _) => false,
+            (None, Some(version)) if version.starts_with("3.") => true,
+            (Some(other), _) | (None, Some(other)) => {
                 return Err(format!(
-                    "swagger version {other:?} is not supported, only \"2.0\""
+                    "version {other:?} is not supported; OpenAPI 2.0, 3.0 and 3.1 are"
                 ))
             }
-            None if root.get("openapi").is_some() => {
+            (None, None) => {
                 return Err(
-                    "this is an OpenAPI 3 description; only OpenAPI 2.0 is supported".into(),
+                    "no `swagger` or `openapi` version field; is this an OpenAPI description?"
+                        .into(),
                 )
             }
-            None => {
-                return Err(
-                    "no `swagger: \"2.0\"` field; is this an OpenAPI 2.0 description?".into(),
-                )
-            }
-        }
+        };
         Ok(Spec {
             root: Rc::new(root),
+            v3,
         })
     }
 
@@ -99,8 +102,14 @@ impl Spec {
         Spec::parse(&text).map_err(|e| format!("{path}: {e}"))
     }
 
-    /// The base URL the description itself names, when it names a host.
+    /// The base URL the description itself names, when it names one:
+    /// `host` and `basePath` in 2.0, the first absolute server URL in 3.x.
     pub fn base_url(&self) -> Option<String> {
+        if self.v3 {
+            let url = self.root.pointer("/servers/0/url")?.as_str()?;
+            let absolute = url.starts_with("http://") || url.starts_with("https://");
+            return (absolute && !url.contains('{')).then(|| url.trim_end_matches('/').to_string());
+        }
         let host = self.root.get("host")?.as_str()?;
         let schemes = self.root.get("schemes").and_then(Value::as_array);
         let scheme = schemes
@@ -125,7 +134,9 @@ impl Spec {
         for (path, item) in paths.into_iter().flatten() {
             for method in METHODS {
                 if let Some(operation) = item.get(method) {
-                    operations.push(Operation::new(&self.root, path, method, item, operation));
+                    operations.push(Operation::new(
+                        &self.root, self.v3, path, method, item, operation,
+                    ));
                 }
             }
         }
@@ -136,12 +147,20 @@ impl Spec {
 #[derive(Clone)]
 struct Parameter {
     name: String,
+    /// `path`, `query`, `header`, `cookie`, `formData`, `body`, or `form`
+    /// for a URL-encoded body described by one object schema.
     location: String,
     required: bool,
-    /// The schema of a body, or the parameter object itself, which carries
-    /// the same keywords for the other locations.
     schema: Value,
     collection_format: String,
+}
+
+/// What the description says about the response for one status.
+#[derive(Clone)]
+struct Documented {
+    schema: Option<Value>,
+    /// The media types the response may have. Empty when none are named.
+    media: Vec<String>,
 }
 
 /// One method on one path.
@@ -152,9 +171,12 @@ pub struct Operation {
     pub path: String,
     pub operation_id: Option<String>,
     parameters: Vec<Parameter>,
-    consumes: Vec<String>,
-    produces: Vec<String>,
-    responses: Value,
+    /// The media type of a JSON request body.
+    body_media: String,
+    /// The `Accept` header, when the description gives grounds for one.
+    accept: Option<String>,
+    /// Status code, range such as `2XX`, or `default`, to its response.
+    responses: Vec<(String, Documented)>,
     /// Why the operation cannot be checked, when it cannot.
     pub unsupported: Option<String>,
     /// Parts of the description that generation does not enforce.
@@ -186,28 +208,38 @@ fn mentions_pattern(root: &Value, schema: &Value, depth: usize) -> bool {
     if depth > 8 {
         return false;
     }
-    let schema = schema::resolve(root, schema);
-    match schema {
-        Value::Object(map) => {
-            map.contains_key("pattern")
-                || map.iter().any(|(key, value)| match key.as_str() {
-                    "items" => mentions_pattern(root, value, depth + 1),
-                    "properties" => value
-                        .as_object()
-                        .is_some_and(|p| p.values().any(|v| mentions_pattern(root, v, depth + 1))),
-                    "allOf" => value
-                        .as_array()
-                        .is_some_and(|a| a.iter().any(|v| mentions_pattern(root, v, depth + 1))),
-                    _ => false,
-                })
-        }
-        _ => false,
+    let Value::Object(map) = schema::resolve(root, schema) else {
+        return false;
+    };
+    let deeper = |value: &Value| mentions_pattern(root, value, depth + 1);
+    map.contains_key("pattern")
+        || map.iter().any(|(key, value)| match key.as_str() {
+            "items" => deeper(value),
+            "properties" => value.as_object().is_some_and(|p| p.values().any(deeper)),
+            "allOf" | "oneOf" | "anyOf" => value.as_array().is_some_and(|a| a.iter().any(deeper)),
+            _ => false,
+        })
+}
+
+fn is_json(media: &str) -> bool {
+    let media = media.split(';').next().unwrap_or("").trim();
+    media == "application/json" || media.ends_with("+json")
+}
+
+/// True when `media` falls under `pattern`, which may be `*/*` or `type/*`.
+fn media_matches(pattern: &str, media: &str) -> bool {
+    let pattern = pattern.split(';').next().unwrap_or("").trim();
+    match pattern.split_once('/') {
+        Some(("*", "*")) => true,
+        Some((kind, "*")) => media.split('/').next() == Some(kind),
+        _ => pattern.eq_ignore_ascii_case(media),
     }
 }
 
 impl Operation {
     fn new(
         root: &Rc<Value>,
+        v3: bool,
         path: &str,
         method: &str,
         item: &Value,
@@ -232,22 +264,32 @@ impl Operation {
             if field("type") == "file" {
                 unsupported = Some("file uploads are not supported".to_string());
             }
-            let schema = match location.as_str() {
-                "body" => parameter.get("schema").cloned().unwrap_or(json!({})),
-                _ => parameter.clone(),
+            // In 2.0 only a body has a schema; the other parameters carry
+            // the schema keywords themselves. In 3.x each has a schema.
+            let schema = match (v3, location.as_str()) {
+                (true, _) | (false, "body") => {
+                    parameter.get("schema").cloned().unwrap_or(json!({}))
+                }
+                (false, _) => parameter.clone(),
             };
-            if mentions_pattern(root, &schema, 0) {
-                warnings.push(format!(
-                    "`pattern` on parameter {name:?} is not enforced; generated values may not match it"
-                ));
-            }
+            let collection_format = match (v3, field("collectionFormat"), field("style")) {
+                (false, "", _) => "csv",
+                (false, format, _) => format,
+                (true, _, "spaceDelimited") => "ssv",
+                (true, _, "pipeDelimited") => "pipes",
+                // `form` style explodes by default: one pair per item.
+                (true, _, _) if matches!(location.as_str(), "query" | "cookie") => {
+                    match parameter.get("explode") {
+                        Some(Value::Bool(false)) => "csv",
+                        _ => "multi",
+                    }
+                }
+                (true, _, _) => "csv",
+            };
             let parsed = Parameter {
                 required: location == "path"
                     || parameter.get("required") == Some(&Value::Bool(true)),
-                collection_format: match field("collectionFormat") {
-                    "" => "csv".to_string(),
-                    format => format.to_string(),
-                },
+                collection_format: collection_format.to_string(),
                 name,
                 location,
                 schema,
@@ -261,27 +303,105 @@ impl Operation {
             }
         }
 
-        let inherited = |name: &str, default: &str| {
-            strings(operation.get(name))
-                .or_else(|| strings(root.get(name)))
-                .unwrap_or_else(|| vec![default.to_string()])
-        };
-        let consumes = inherited("consumes", "application/json");
-        let produces = inherited("produces", "application/json");
+        let inherited =
+            |name: &str| strings(operation.get(name)).or_else(|| strings(root.get(name)));
+        let mut body_media = "application/json".to_string();
+        let mut accept = None;
 
-        let has = |location: &str| parameters.iter().any(|p| p.location == location);
-        if has("body") && !consumes.iter().any(|m| m.contains("json")) {
-            unsupported = Some(format!(
-                "request bodies of type {} are not supported",
-                consumes.join(", ")
-            ));
+        if v3 {
+            if let Some(body) = operation.get("requestBody") {
+                let body = schema::resolve(root, body);
+                let content = body.get("content").and_then(Value::as_object);
+                let find = |wanted: &dyn Fn(&str) -> bool| {
+                    content.and_then(|c| c.iter().find(|(media, _)| wanted(media)))
+                };
+                let json_body = find(&is_json);
+                let form_body = find(&|m| m == "application/x-www-form-urlencoded");
+                match json_body.or(form_body) {
+                    Some((media, described)) => {
+                        if json_body.is_some() {
+                            body_media = media.clone();
+                        }
+                        parameters.push(Parameter {
+                            name: "body".to_string(),
+                            location: if json_body.is_some() { "body" } else { "form" }.to_string(),
+                            required: body.get("required") == Some(&Value::Bool(true)),
+                            schema: described.get("schema").cloned().unwrap_or(json!({})),
+                            collection_format: "multi".to_string(),
+                        });
+                    }
+                    None => {
+                        let offered: Vec<&str> = content
+                            .map(|c| c.keys().map(String::as_str).collect())
+                            .unwrap_or_default();
+                        unsupported = Some(format!(
+                            "request bodies of type {} are not supported",
+                            offered.join(", ")
+                        ));
+                    }
+                }
+            }
+        } else {
+            let consumes = inherited("consumes").unwrap_or(vec!["application/json".to_string()]);
+            let has = |location: &str| parameters.iter().any(|p| p.location == location);
+            match consumes.iter().find(|m| is_json(m)) {
+                Some(media) => body_media = media.clone(),
+                None if has("body") => {
+                    unsupported = Some(format!(
+                        "request bodies of type {} are not supported",
+                        consumes.join(", ")
+                    ));
+                }
+                None => {}
+            }
+            if has("formData")
+                && !consumes
+                    .iter()
+                    .any(|m| m == "application/x-www-form-urlencoded")
+            {
+                unsupported.get_or_insert("multipart form data is not supported".to_string());
+            }
         }
-        if has("formData")
-            && !consumes
-                .iter()
-                .any(|m| m == "application/x-www-form-urlencoded")
-        {
-            unsupported.get_or_insert("multipart form data is not supported".to_string());
+
+        for parameter in &parameters {
+            if mentions_pattern(root, &parameter.schema, 0) {
+                warnings.push(format!(
+                    "`pattern` on parameter {:?} is not enforced; generated values may not match it",
+                    parameter.name
+                ));
+            }
+        }
+
+        let produces = inherited("produces").unwrap_or(vec!["application/json".to_string()]);
+        if !v3 {
+            accept = Some(produces.join(", "));
+        }
+        let mut responses = Vec::new();
+        let listed = operation.get("responses").and_then(Value::as_object);
+        for (status, response) in listed.into_iter().flatten() {
+            let response = schema::resolve(root, response);
+            let documented = if v3 {
+                let content = response.get("content").and_then(Value::as_object);
+                Documented {
+                    schema: content
+                        .and_then(|c| c.iter().find(|(media, _)| is_json(media)))
+                        .and_then(|(_, described)| described.get("schema").cloned()),
+                    media: content
+                        .map(|c| c.keys().cloned().collect())
+                        .unwrap_or_default(),
+                }
+            } else {
+                let schema = response.get("schema").cloned();
+                Documented {
+                    media: if schema.is_some() {
+                        produces.clone()
+                    } else {
+                        Vec::new()
+                    },
+                    schema,
+                }
+            };
+            responses.push((status.to_uppercase(), documented));
         }
 
         Operation {
@@ -293,9 +413,9 @@ impl Operation {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             parameters,
-            consumes,
-            produces,
-            responses: operation.get("responses").cloned().unwrap_or(json!({})),
+            body_media,
+            accept,
+            responses,
             unsupported,
             warnings,
         }
@@ -350,51 +470,65 @@ impl Operation {
             method: self.method.clone(),
             path: self.path.clone(),
             query: Vec::new(),
-            headers: vec![("accept".to_string(), self.produces.join(", "))],
+            headers: Vec::new(),
             body: None,
         };
-        let mut form = Vec::new();
+        if let Some(accept) = &self.accept {
+            request.headers.push(("accept".to_string(), accept.clone()));
+        }
+        let (mut form, mut cookies) = (Vec::new(), Vec::new());
 
         for (parameter, value) in self.parameters.iter().zip(values) {
             let Some(value) = value else { continue };
             let name = parameter.name.clone();
+            let format = parameter.collection_format.as_str();
             match parameter.location.as_str() {
                 "path" => {
-                    let segment = percent_encode(&flat(value, &parameter.collection_format));
+                    let segment = percent_encode(&flat(value, format));
                     request.path = request.path.replace(&format!("{{{name}}}"), &segment);
                 }
-                "query" => spread(
-                    &mut request.query,
-                    name,
-                    value,
-                    &parameter.collection_format,
-                ),
-                "formData" => spread(&mut form, name, value, &parameter.collection_format),
-                "header" => request
-                    .headers
-                    .push((name, flat(value, &parameter.collection_format))),
+                "query" => spread(&mut request.query, name, value, format),
+                "formData" => spread(&mut form, name, value, format),
+                "cookie" => spread(&mut cookies, name, value, format),
+                "header" => request.headers.push((name, flat(value, format))),
                 "body" => {
-                    let media = self.consumes.iter().find(|m| m.contains("json"));
-                    let media = media.cloned().unwrap_or("application/json".to_string());
-                    request.headers.push(("content-type".to_string(), media));
+                    request
+                        .headers
+                        .push(("content-type".to_string(), self.body_media.clone()));
                     request.body = Some(Body::Json(value.clone()));
+                }
+                // One object schema describes the whole form.
+                "form" => {
+                    for (field, member) in value.as_object().into_iter().flatten() {
+                        spread(&mut form, field.clone(), member, format);
+                    }
+                    request.body = Some(Body::Form(Vec::new()));
                 }
                 _ => {}
             }
         }
-        if !form.is_empty() {
+        if !cookies.is_empty() {
+            let pairs: Vec<String> = cookies.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            request
+                .headers
+                .push(("cookie".to_string(), pairs.join("; ")));
+        }
+        if !form.is_empty() || request.body == Some(Body::Form(Vec::new())) {
             request.body = Some(Body::Form(form));
         }
         request
     }
 
-    /// The documented response for a status: the exact code, else `default`.
-    fn documented(&self, status: u16) -> Option<&Value> {
-        let response = self
-            .responses
-            .get(status.to_string())
-            .or_else(|| self.responses.get("default"))?;
-        Some(schema::resolve(&self.root, response))
+    /// The documented response for a status: the exact code, else its
+    /// range (`4XX`), else `default`.
+    fn documented(&self, status: u16) -> Option<&Documented> {
+        let exact = status.to_string();
+        let range = format!("{}XX", status / 100);
+        let keys = [exact.as_str(), range.as_str(), "DEFAULT"];
+        let found = keys
+            .into_iter()
+            .find_map(|key| self.responses.iter().find(|(k, _)| k == key));
+        found.map(|(_, documented)| documented)
     }
 
     /// The first enabled check the response fails, in the order of
@@ -412,11 +546,11 @@ impl Operation {
         }
         let Some(documented) = self.documented(status) else {
             if on(Check::DocumentedStatus) {
-                let mut known: Vec<&str> = self
+                let mut known: Vec<String> = self
                     .responses
-                    .as_object()
-                    .map(|r| r.keys().map(String::as_str).collect())
-                    .unwrap_or_default();
+                    .iter()
+                    .map(|(k, _)| k.to_lowercase())
+                    .collect();
                 known.sort();
                 return fail(
                     Check::DocumentedStatus,
@@ -428,22 +562,27 @@ impl Operation {
             }
             return Ok(());
         };
-        let Some(schema) = documented.get("schema") else {
-            return Ok(());
-        };
 
         let media = response.media_type().unwrap_or_default();
-        if on(Check::ContentType) && !self.produces.iter().any(|m| m.eq_ignore_ascii_case(&media)) {
+        let has_body = !response.body.is_empty();
+        if on(Check::ContentType)
+            && has_body
+            && !documented.media.is_empty()
+            && !documented.media.iter().any(|m| media_matches(m, &media))
+        {
             return fail(
                 Check::ContentType,
                 format!(
-                    "content type {:?} is not in produces ({})",
+                    "content type {:?} is not documented for status {status} ({})",
                     response.header("content-type").unwrap_or(""),
-                    self.produces.join(", ")
+                    documented.media.join(", ")
                 ),
             );
         }
-        if on(Check::ResponseSchema) && (media.contains("json") || media.is_empty()) {
+        let Some(schema) = &documented.schema else {
+            return Ok(());
+        };
+        if on(Check::ResponseSchema) && (is_json(&media) || media.is_empty()) {
             let body: Value = match serde_json::from_str(&response.body) {
                 Ok(body) => body,
                 Err(e) => return fail(Check::ResponseSchema, format!("body is not JSON: {e}")),

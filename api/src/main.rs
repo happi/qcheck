@@ -12,7 +12,7 @@ qcheck: QuickCheck for APIs
 Usage:
   qcheck openapi <spec> [options]
 
-Reads an OpenAPI 2.0 description (JSON or YAML), generates valid requests
+Reads an OpenAPI description (2.0, 3.0 or 3.1; JSON or YAML), generates valid requests
 for each operation, and checks every response against the description.
 A failing request is shrunk to the smallest one that still fails.
 

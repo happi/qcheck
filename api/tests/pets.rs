@@ -80,6 +80,35 @@ fn an_undocumented_status_shrinks_the_request_body() {
     );
 }
 
+/// The same API described in OpenAPI 3.1. Its description lists `4XX` for
+/// `createPet`, so the 422 is documented there and that operation passes.
+#[test]
+fn an_openapi_3_description_finds_the_same_bugs() {
+    let spec = Spec::load(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/pets-v3.yaml"
+    ))
+    .unwrap();
+    assert_eq!(spec.base_url().as_deref(), Some("http://127.0.0.1:8642"));
+    let adapter = adapter(HttpVersion::Http11);
+
+    let list = failure(&spec, &adapter, "listPets");
+    assert_eq!(list.violation.check, Check::NoServerError);
+    assert_eq!(list.request.target(), "/pets?limit=0");
+
+    let get = failure(&spec, &adapter, "getPet");
+    assert_eq!(get.violation.message, "$.name: expected string, got null");
+    assert_eq!(get.request.path, "/pets/1001");
+
+    for operation in ["health", "createPet"] {
+        let reports = check_spec(&spec, &adapter, &options(), Some(operation));
+        assert!(
+            matches!(reports[0].verdict, Verdict::Passed { tests: 100 }),
+            "{operation}"
+        );
+    }
+}
+
 #[test]
 fn a_disabled_check_is_not_reported() {
     let options = Options {
@@ -192,10 +221,10 @@ fn a_helper_process_serves_the_same_checks() {
 }
 
 #[test]
-fn descriptions_that_are_not_openapi_2_are_refused() {
-    assert!(Spec::parse("openapi: 3.0.0")
+fn descriptions_that_are_not_openapi_are_refused() {
+    assert!(Spec::parse("openapi: 4.0.0")
         .err()
         .unwrap()
-        .contains("OpenAPI 3"));
-    assert!(Spec::parse("{}").err().unwrap().contains("swagger"));
+        .contains("not supported"));
+    assert!(Spec::parse("{}").err().unwrap().contains("version field"));
 }

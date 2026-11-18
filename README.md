@@ -6,8 +6,8 @@ to the smallest one that still fails.
 
 It tests from the outside, through an adapter, so the API can be written in
 any language. Two adapters are built in: HTTP (versions 1.0, 1.1, 2 and 3)
-and a helper process that speaks JSON lines. Given an OpenAPI 2.0
-description, qcheck derives the requests and the checks itself.
+and a helper process that speaks JSON lines. Given an OpenAPI description
+(2.0, 3.0 or 3.1), qcheck derives the requests and the checks itself.
 
 The repository holds two crates. `qcheck` is the property testing library,
 with no dependencies. `qcheck-api` in `api/` adds the adapters, the OpenAPI
@@ -85,18 +85,25 @@ Values follow the schema: `type`, `format` (int32, int64, date, date-time,
 uuid, email, byte), `enum`, `minimum` and `maximum` with their exclusive
 forms, `multipleOf` for integers, `minLength`, `maxLength`, `minItems`,
 `maxItems`, `uniqueItems`, `required`, `allOf`, and `$ref` into the same
-file, recursive references included.
+file, recursive references included. From OpenAPI 3.x: `requestBody` (JSON
+or URL-encoded), `oneOf`, `anyOf`, `const`, `nullable`, type lists such as
+`["string", "null"]`, numeric exclusive bounds, and cookie parameters.
 
 | Check | A response fails when |
 |---|---|
 | `transport` | no response came back |
 | `no-server-error` | the status is 500 or above |
 | `documented-status` | the status is not listed and there is no `default` response |
-| `content-type` | a response with a documented schema has a media type outside `produces` |
+| `content-type` | the body has a media type the description does not list for the status |
 | `response-schema` | the JSON body does not conform to the schema documented for the status |
 
 Shrinking keeps to the check that failed first. `--skip-check` turns one
-off.
+off. A value passes `oneOf` when at least one alternative accepts it; a
+second match is not reported, since overlapping alternatives are common.
+
+Authentication is yours to supply: pass the header with `-H`, for example
+`-H 'Authorization: Bearer ...'`. Security schemes in the description are
+not read.
 
 ## HTTP versions
 
@@ -157,7 +164,7 @@ forall(gens::range(0i64, 1000), |n| {
 
 ## Not covered yet
 
-- OpenAPI 3 descriptions, and `$ref` to other files.
+- `$ref` to other files, and OpenAPI 3 `servers` with variables.
 - `pattern`: generated strings ignore it, and the report says so per
   operation.
 - File uploads, multipart forms, and request bodies other than JSON and

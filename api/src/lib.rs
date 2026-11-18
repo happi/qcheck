@@ -6,7 +6,7 @@
 //! [`HttpAdapter`] speaks HTTP/1.0, 1.1, 2 and 3, and [`ExecAdapter`] talks
 //! to a helper process in any language over JSON lines.
 //!
-//! [`openapi`] reads an OpenAPI 2.0 description and derives, for each
+//! [`openapi`] reads an OpenAPI description (2.0, 3.0 or 3.1) and derives, for each
 //! operation, a generator of valid requests and the checks a response must
 //! pass.
 

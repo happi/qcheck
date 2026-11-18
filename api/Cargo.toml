@@ -2,7 +2,7 @@
 name = "qcheck-api"
 version = "0.1.0"
 edition = "2021"
-description = "QuickCheck for APIs: generated checks over HTTP and other adapters, from OpenAPI 2.0"
+description = "QuickCheck for APIs: generated checks over HTTP and other adapters, from OpenAPI 2.0 and 3.x"
 license = "MIT OR Apache-2.0"
 publish = false
 

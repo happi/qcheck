@@ -1,0 +1,92 @@
+openapi: 3.1.0
+info:
+  title: Pets
+  version: "1.0"
+servers:
+  - url: http://127.0.0.1:8642
+
+paths:
+  /health:
+    get:
+      operationId: health
+      responses:
+        "200":
+          description: The service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: {const: ok}
+
+  /pets:
+    get:
+      operationId: listPets
+      parameters:
+        - {name: limit, in: query, schema: {type: integer, minimum: 0, maximum: 100}}
+        - {name: tag, in: query, schema: {type: [string, "null"], maxLength: 10}}
+      responses:
+        "200":
+          description: A page of pets.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: "#/components/schemas/Pet"}
+    post:
+      operationId: createPet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/NewPet"}
+      responses:
+        "201":
+          description: The pet as stored.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Pet"}
+        4XX:
+          $ref: "#/components/responses/Error"
+
+  /pets/{id}:
+    get:
+      operationId: getPet
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: integer, exclusiveMinimum: 0}}
+      responses:
+        "200":
+          description: The pet.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Pet"}
+        "404":
+          $ref: "#/components/responses/Error"
+
+components:
+  responses:
+    Error:
+      description: The request was refused.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [error]
+            properties:
+              error: {type: string}
+  schemas:
+    NewPet:
+      type: object
+      required: [name, age]
+      properties:
+        name: {type: string, minLength: 1, maxLength: 20}
+        age: {type: integer, minimum: 0, maximum: 30}
+        tag: {type: [string, "null"], maxLength: 10}
+    Pet:
+      allOf:
+        - $ref: "#/components/schemas/NewPet"
+        - type: object
+          required: [id]
+          properties:
+            id: {type: integer, minimum: 1}

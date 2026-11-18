@@ -75,13 +75,23 @@ fn flatten(root: &Value, schema: &Value) -> Value {
     Value::Object(merged)
 }
 
-fn kind(schema: &Value) -> &str {
-    match schema.get("type").and_then(Value::as_str) {
-        Some(name) => name,
-        None if schema.get("properties").is_some() => "object",
-        None if schema.get("items").is_some() => "array",
-        None => "any",
+/// The types a schema allows. OpenAPI 3.1 may list several, and `null`
+/// among them.
+fn types(schema: &Value) -> Vec<&str> {
+    match schema.get("type") {
+        Some(Value::String(name)) => vec![name.as_str()],
+        Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).collect(),
+        _ if schema.get("properties").is_some() => vec!["object"],
+        _ if schema.get("items").is_some() => vec!["array"],
+        _ => vec!["any"],
     }
+}
+
+/// Null is allowed by a `null` type (3.1), `nullable` (3.0), or the
+/// `x-nullable` extension (2.0).
+fn nullable(schema: &Value) -> bool {
+    let flag = |name| schema.get(name) == Some(&Value::Bool(true));
+    types(schema).contains(&"null") || flag("nullable") || flag("x-nullable")
 }
 
 /// A generator of JSON values that satisfy `schema`.
@@ -111,13 +121,44 @@ fn generator_at(root: &Rc<Value>, schema: &Value, depth: usize) -> Generator<Val
         }
     }
 
-    match kind(&schema) {
-        "integer" => integer(&schema),
-        "number" => number(&schema),
-        "string" => string(&schema),
+    if let Some(value) = schema.get("const") {
+        return gens::constant(value.clone());
+    }
+    for key in ["oneOf", "anyOf"] {
+        if let Some(alternatives) = schema.get(key).and_then(Value::as_array) {
+            if !alternatives.is_empty() {
+                let choices = alternatives.iter().map(|a| generator_at(root, a, depth));
+                return gens::one_of(choices.collect());
+            }
+        }
+    }
+
+    let mut choices: Vec<Generator<Value>> = types(&schema)
+        .into_iter()
+        .filter(|name| *name != "null")
+        .map(|name| typed(root, &schema, name, depth))
+        .collect();
+    let value = match choices.len() {
+        0 => return gens::constant(Value::Null),
+        1 => choices.remove(0),
+        _ => gens::one_of(choices),
+    };
+    if nullable(&schema) {
+        // The value comes first, so a nullable field shrinks to a simple
+        // value and reports null only when null is what fails.
+        return gens::frequency(vec![(4, value), (1, gens::constant(Value::Null))]);
+    }
+    value
+}
+
+fn typed(root: &Rc<Value>, schema: &Value, name: &str, depth: usize) -> Generator<Value> {
+    match name {
+        "integer" => integer(schema),
+        "number" => number(schema),
+        "string" => string(schema),
         "boolean" => gens::any::<bool>().map(Value::Bool),
-        "array" => array(root, &schema, depth),
-        "object" => object(root, &schema, depth),
+        "array" => array(root, schema, depth),
+        "object" => object(root, schema, depth),
         _ => gens::one_of(vec![
             gens::constant(Value::Null),
             gens::any::<bool>().map(Value::Bool),
@@ -139,20 +180,31 @@ fn spread(lo: i64, hi: i64) -> Generator<i64> {
 
 /// The inclusive bounds of a numeric schema in units of `1 / scale`.
 fn bounds(schema: &Value, scale: f64, default: (i64, i64)) -> (i64, i64) {
+    let number = |name| schema.get(name).and_then(Value::as_f64);
+    let flag = |name| schema.get(name) == Some(&Value::Bool(true));
     let (mut lo, mut hi) = default;
-    if let Some(min) = schema.get("minimum").and_then(Value::as_f64) {
+
+    if let Some(min) = number("minimum") {
         let scaled = (min * scale).ceil();
         lo = lo.max(scaled as i64);
-        if schema.get("exclusiveMinimum") == Some(&Value::Bool(true)) && scaled == min * scale {
+        // OpenAPI 2.0 and 3.0: a flag beside `minimum`.
+        if flag("exclusiveMinimum") && scaled == min * scale {
             lo += 1;
         }
     }
-    if let Some(max) = schema.get("maximum").and_then(Value::as_f64) {
+    // OpenAPI 3.1: the bound itself.
+    if let Some(min) = number("exclusiveMinimum") {
+        lo = lo.max((min * scale).floor() as i64 + 1);
+    }
+    if let Some(max) = number("maximum") {
         let scaled = (max * scale).floor();
         hi = hi.min(scaled as i64);
-        if schema.get("exclusiveMaximum") == Some(&Value::Bool(true)) && scaled == max * scale {
+        if flag("exclusiveMaximum") && scaled == max * scale {
             hi -= 1;
         }
+    }
+    if let Some(max) = number("exclusiveMaximum") {
+        hi = hi.min((max * scale).ceil() as i64 - 1);
     }
     (lo, hi.max(lo))
 }
@@ -345,10 +397,35 @@ fn check(
         check(root, part, value, at, depth + 1, errors);
     }
 
+    // At least one alternative must accept the value. `oneOf` asks for
+    // exactly one, which descriptions with overlapping alternatives rarely
+    // mean, so a second match is not reported.
+    for key in ["oneOf", "anyOf"] {
+        if let Some(alternatives) = schema.get(key).and_then(Value::as_array) {
+            let accepted = alternatives.iter().any(|alternative| {
+                let mut found = Vec::new();
+                check(root, alternative, value, at, depth + 1, &mut found);
+                found.is_empty()
+            });
+            if !accepted && !alternatives.is_empty() {
+                errors.push(format!("{at}: {value} matches none of the {key} schemas"));
+            }
+        }
+    }
+    if let Some(constant) = schema.get("const") {
+        if constant != value {
+            errors.push(format!(
+                "{at}: expected the constant {constant}, got {value}"
+            ));
+        }
+        return;
+    }
+
+    let allowed = types(schema);
+    let expected = allowed.join(" or ");
     if value.is_null() {
-        let nullable = schema.get("x-nullable") == Some(&Value::Bool(true));
-        if !nullable && kind(schema) != "any" {
-            errors.push(format!("{at}: expected {}, got null", kind(schema)));
+        if !nullable(schema) && !allowed.contains(&"any") {
+            errors.push(format!("{at}: expected {expected}, got null"));
         }
         return;
     }
@@ -359,14 +436,14 @@ fn check(
     }
 
     let actual = type_name(value);
-    let fits = match kind(schema) {
+    let fits = allowed.iter().any(|name| match *name {
         "any" | "file" => true,
         "integer" => actual == "integer" || value.as_f64().is_some_and(|f| f.fract() == 0.0),
         "number" => actual == "integer" || actual == "number",
-        expected => expected == actual,
-    };
+        name => name == actual,
+    });
     if !fits {
-        errors.push(format!("{at}: expected {}, got {actual}", kind(schema)));
+        errors.push(format!("{at}: expected {expected}, got {actual}"));
         return;
     }
 
@@ -384,6 +461,12 @@ fn check(
                 if n > max || (flag("exclusiveMaximum") && n == max) {
                     errors.push(format!("{at}: {n} is above the maximum {max}"));
                 }
+            }
+            if limit("exclusiveMinimum").is_some_and(|min| n <= min) {
+                errors.push(format!("{at}: {n} is not above the exclusive minimum"));
+            }
+            if limit("exclusiveMaximum").is_some_and(|max| n >= max) {
+                errors.push(format!("{at}: {n} is not below the exclusive maximum"));
             }
         }
         Value::String(s) => {
@@ -480,6 +563,19 @@ mod tests {
                         "children": {"type": "array", "items": {"$ref": "#/definitions/Tree"}}
                     }
                 },
+                "Event": {
+                    "type": "object",
+                    "required": ["object", "note", "size", "payload"],
+                    "properties": {
+                        "object": {"const": "event"},
+                        "note": {"type": ["string", "null"], "maxLength": 5},
+                        "size": {"type": "integer", "exclusiveMinimum": 0, "exclusiveMaximum": 10},
+                        "payload": {"oneOf": [
+                            {"type": "string", "enum": ["none"]},
+                            {"type": "object", "required": ["id"], "properties": {"id": {"type": "integer"}}}
+                        ]}
+                    }
+                },
                 "Named": {"type": "object", "required": ["name"], "properties": {"name": {"type": "string"}}},
                 "Dog": {
                     "allOf": [
@@ -511,6 +607,27 @@ mod tests {
     #[test]
     fn recursive_schemas_generate_finite_values() {
         generated_values_validate("Tree");
+    }
+
+    #[test]
+    fn openapi_3_1_keywords_generate_and_validate() {
+        generated_values_validate("Event");
+        let root = root();
+        let event = json!({"$ref": "#/definitions/Event"});
+        let value = json!({"object": "other", "note": 7, "size": 10, "payload": {"id": "x"}});
+        let mut errors = validate(&root, &event, &value);
+        errors.sort();
+        assert_eq!(
+            errors,
+            [
+                "$.note: expected string or null, got integer",
+                "$.object: expected the constant \"event\", got \"other\"",
+                "$.payload: {\"id\":\"x\"} matches none of the oneOf schemas",
+                "$.size: 10 is not below the exclusive maximum",
+            ]
+        );
+        let fine = json!({"object": "event", "note": null, "size": 9, "payload": "none"});
+        assert_eq!(validate(&root, &event, &fine), Vec::<String>::new());
     }
 
     #[test]
