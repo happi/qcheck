@@ -1,0 +1,8 @@
+[package]
+name = "qcheck"
+version = "0.1.0"
+edition = "2021"
+description = "A small QuickCheck: random property testing with shrinking, no dependencies"
+publish = false
+
+[dependencies]
