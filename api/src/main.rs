@@ -22,6 +22,7 @@ qcheck: QuickCheck for APIs
 
 Usage:
   qcheck openapi <spec> [options]
+  qcheck --version
 
 <spec> is a file or an http(s) URL, such as a service's /openapi.json.
 
@@ -49,7 +50,9 @@ Run:
                         parameter or body property of that name. Half the
                         requests use it. May be repeated.
   --operation <text>    Only operations with this operationId, or with this
-                        text in 'METHOD /path'. May be repeated.
+                        text in 'METHOD /path'. With a '*' in it, a pattern
+                        for the operationId, as in '*Unsupported*'. May be
+                        repeated.
   --exclude <text>      Leave out operations that match, same matching.
                         May be repeated.
   --exclude-from <file> Exclusions from a file, one per line, as
@@ -411,6 +414,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("openapi") => {}
+        Some("-V" | "--version" | "version") => {
+            say!("qcheck {}", env!("CARGO_PKG_VERSION"));
+            return ExitCode::SUCCESS;
+        }
         Some("-h" | "--help" | "help") | None => {
             say!("{}", USAGE.trim_end());
             return ExitCode::SUCCESS;

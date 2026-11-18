@@ -23,7 +23,7 @@ curl -fsSL -o qcheck https://github.com/happi/qcheck/releases/latest/download/qc
 chmod +x qcheck
 ```
 
-Pin a version in CI by replacing `latest/download` with `download/v0.1.1`.
+Pin a version in CI by replacing `latest/download` with `download/v0.2.0`.
 From source: `cargo build --release -p qcheck-api --bin qcheck` in a
 checkout, which picks up the build flag in `.cargo/config.toml`.
 
@@ -141,7 +141,7 @@ or URL-encoded), `oneOf`, `anyOf`, `const`, `nullable`, type lists such as
 | Check | A response fails when |
 |---|---|
 | `transport` | no response came back |
-| `no-server-error` | the status is 500 or above |
+| `no-server-error` | the status is 500 or above, unless the description lists that code or `5XX` |
 | `documented-status` | the status is not listed and there is no `default` response |
 | `content-type` | the body has a media type the description does not list for the status |
 | `response-schema` | the JSON body does not conform to the schema documented for the status |

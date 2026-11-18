@@ -159,6 +159,49 @@ fn a_fixture_value_reaches_the_path_that_needs_existing_data() {
 }
 
 #[test]
+fn a_documented_5xx_is_not_a_server_error_but_default_does_not_excuse_one() {
+    let describe = |responses: &str| {
+        let text = format!(
+            r#"{{"swagger": "2.0", "paths": {{"/pets": {{"get": {{"operationId": "listPets",
+                "parameters": [{{"name": "limit", "in": "query", "type": "integer", "enum": [0]}}],
+                "responses": {responses}}}}}}}}}"#
+        );
+        Spec::parse(&text).unwrap()
+    };
+    let adapter = adapter(HttpVersion::Http11);
+    let run = |spec: &Spec| {
+        check_spec(spec, &adapter, &options(), None)
+            .remove(0)
+            .verdict
+    };
+
+    // `GET /pets?limit=0` answers 500 on the example server.
+    let promised = describe(r#"{"200": {"description": "ok"}, "500": {"description": "known"}}"#);
+    assert!(matches!(run(&promised), Verdict::Passed { .. }));
+    let ranged = describe(r#"{"200": {"description": "ok"}, "5XX": {"description": "known"}}"#);
+    assert!(matches!(run(&ranged), Verdict::Passed { .. }));
+    let catch_all = describe(r#"{"default": {"description": "anything"}}"#);
+    match run(&catch_all) {
+        Verdict::Failed(failure) => assert_eq!(failure.violation.check, Check::NoServerError),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_filter_with_a_star_is_a_pattern_for_the_operation_id() {
+    let spec = spec();
+    let ids = |filter: &str| -> Vec<String> {
+        let matching = spec.operations().into_iter().filter(|o| o.matches(filter));
+        matching.filter_map(|o| o.operation_id).collect()
+    };
+    assert_eq!(ids("*Pet"), ["createPet", "getPet"]);
+    assert_eq!(ids("*Pet*"), ["listPets", "createPet", "getPet"]);
+    assert_eq!(ids("get*"), ["getPet"]);
+    assert_eq!(ids("getPet"), ["getPet"]);
+    assert_eq!(ids("GET /pets"), ["listPets", "getPet"]);
+}
+
+#[test]
 fn path_parameters_are_never_dot_segments() {
     let spec = Spec::parse(
         r#"{"swagger": "2.0", "paths": {"/files/{name}": {"get": {

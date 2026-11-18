@@ -19,7 +19,8 @@ const METHODS: [&str; 7] = ["get", "put", "post", "delete", "options", "head", "
 pub enum Check {
     /// The call completed: a response came back at all.
     Transport,
-    /// The status is below 500.
+    /// The status is below 500, or is a 5xx the description lists by code
+    /// or range.
     NoServerError,
     /// The status is listed for the operation, or the operation has a
     /// `default` response.
@@ -453,9 +454,14 @@ impl Operation {
     }
 
     /// True when `filter` is the operation id or occurs in `METHOD /path`.
+    /// A filter with `*` in it is a pattern for the operation id, where
+    /// each `*` stands for any run of characters.
     pub fn matches(&self, filter: &str) -> bool {
-        self.operation_id.as_deref() == Some(filter)
-            || format!("{} {}", self.method, self.path).contains(filter)
+        let id = self.operation_id.as_deref();
+        if filter.contains('*') {
+            return id.is_some_and(|id| glob(filter, id));
+        }
+        id == Some(filter) || format!("{} {}", self.method, self.path).contains(filter)
     }
 
     /// A generator of requests the description calls valid. Optional
@@ -615,7 +621,15 @@ impl Operation {
         let on = |check| enabled.contains(&check);
         let status = response.status;
 
-        if on(Check::NoServerError) && status >= 500 {
+        // A 5xx the description lists by code or as `5XX` is an answer the
+        // API promises, such as 501 for an endpoint it declines to
+        // implement. `default` does not count: it would excuse every crash.
+        let range = format!("{}XX", status / 100);
+        let promised = self
+            .responses
+            .iter()
+            .any(|(key, _)| *key == status.to_string() || *key == range);
+        if on(Check::NoServerError) && status >= 500 && !promised {
             return fail(
                 Check::NoServerError,
                 format!("server error: status {status}"),
@@ -670,6 +684,18 @@ impl Operation {
             }
         }
         Ok(())
+    }
+}
+
+fn glob(pattern: &str, text: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == text,
+        Some((head, rest)) => {
+            text.starts_with(head)
+                && (head.len()..=text.len())
+                    .filter(|i| text.is_char_boundary(*i))
+                    .any(|i| glob(rest, &text[i..]))
+        }
     }
 }
 
