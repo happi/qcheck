@@ -1,7 +1,10 @@
 //! Runs a property against random inputs and shrinks the first failure.
 
 use crate::arbitrary::Arbitrary;
-use crate::gen::Gen;
+use crate::generator::Generator;
+use crate::gens;
+use crate::rng::Gen;
+use crate::tree::Tree;
 use std::cell::Cell;
 use std::fmt::{self, Debug};
 use std::panic::{self, AssertUnwindSafe};
@@ -151,12 +154,22 @@ impl QuickCheck {
         self
     }
 
-    /// Runs the property and reports what happened.
+    /// Runs the property on values of an `Arbitrary` type.
     pub fn run<A, R, F>(&self, prop: F) -> Outcome<A>
     where
         A: Arbitrary,
         R: Testable,
         F: Fn(A) -> R,
+    {
+        self.run_with(&gens::any::<A>(), prop)
+    }
+
+    /// Runs the property on values drawn from a generator.
+    pub fn run_with<T, R, F>(&self, generator: &Generator<T>, prop: F) -> Outcome<T>
+    where
+        T: Clone + Debug + 'static,
+        R: Testable,
+        F: Fn(T) -> R,
     {
         let mut g = Gen::new(self.seed, 0);
         let (mut passed, mut discards) = (0u32, 0u32);
@@ -167,8 +180,8 @@ impl QuickCheck {
             let step = (passed + discards) as usize;
             g.set_size((step * (self.max_size + 1) / self.tests as usize).min(self.max_size));
 
-            let input = A::arbitrary(&mut g);
-            match apply(&prop, input.clone()) {
+            let tree = generator.tree(&mut g);
+            match apply(&prop, tree.value().clone()) {
                 TestResult::Pass => passed += 1,
                 TestResult::Discard => {
                     discards += 1;
@@ -180,10 +193,11 @@ impl QuickCheck {
                     }
                 }
                 TestResult::Fail(reason) => {
-                    let (shrunk, reason, shrinks) = self.shrink(&prop, input.clone(), reason);
+                    let original = tree.value().clone();
+                    let (shrunk, reason, shrinks) = self.shrink(&prop, tree, reason);
                     return Outcome::Failed(Failure {
                         shrunk,
-                        original: input,
+                        original,
                         shrinks,
                         passed,
                         seed: self.seed,
@@ -204,7 +218,18 @@ impl QuickCheck {
         R: Testable,
         F: Fn(A) -> R,
     {
-        match self.run(prop) {
+        self.check_with(&gens::any::<A>(), prop)
+    }
+
+    /// `check` for values drawn from a generator.
+    #[track_caller]
+    pub fn check_with<T, R, F>(&self, generator: &Generator<T>, prop: F)
+    where
+        T: Clone + Debug + 'static,
+        R: Testable,
+        F: Fn(T) -> R,
+    {
+        match self.run_with(generator, prop) {
             Outcome::Passed { .. } => {}
             Outcome::GaveUp { tests, discards } => panic!(
                 "gave up after {tests} tests and {discards} discards (seed {})",
@@ -214,19 +239,20 @@ impl QuickCheck {
         }
     }
 
-    /// Greedy descent: move to the first simpler input that still fails,
-    /// and stop when none does.
-    fn shrink<A, R, F>(&self, prop: &F, mut current: A, mut reason: String) -> (A, String, u32)
+    /// Greedy descent through the shrink tree: move to the first child
+    /// that still fails, and stop when none does.
+    fn shrink<T, R, F>(&self, prop: &F, tree: Tree<T>, mut reason: String) -> (T, String, u32)
     where
-        A: Arbitrary,
+        T: Clone + 'static,
         R: Testable,
-        F: Fn(A) -> R,
+        F: Fn(T) -> R,
     {
+        let mut current = tree;
         let mut steps = 0;
         'descend: while steps < self.max_shrinks {
-            for candidate in current.shrink() {
-                if let TestResult::Fail(r) = apply(prop, candidate.clone()) {
-                    current = candidate;
+            for child in current.children() {
+                if let TestResult::Fail(r) = apply(prop, child.value().clone()) {
+                    current = child;
                     reason = r;
                     steps += 1;
                     continue 'descend;
@@ -234,11 +260,12 @@ impl QuickCheck {
             }
             break;
         }
-        (current, reason, steps)
+        (current.value().clone(), reason, steps)
     }
 }
 
-/// Checks a property with the default configuration.
+/// Checks a property on values of an `Arbitrary` type, with the default
+/// configuration.
 #[track_caller]
 pub fn quickcheck<A, R, F>(prop: F)
 where
@@ -247,6 +274,18 @@ where
     F: Fn(A) -> R,
 {
     QuickCheck::new().check(prop)
+}
+
+/// Checks a property on values drawn from a generator, with the default
+/// configuration.
+#[track_caller]
+pub fn forall<T, R, F>(generator: Generator<T>, prop: F)
+where
+    T: Clone + Debug + 'static,
+    R: Testable,
+    F: Fn(T) -> R,
+{
+    QuickCheck::new().check_with(&generator, prop)
 }
 
 thread_local! {

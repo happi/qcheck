@@ -1,6 +1,6 @@
 //! Types that can be generated at random and shrunk toward simpler values.
 
-use crate::gen::Gen;
+use crate::rng::Gen;
 use std::fmt::Debug;
 
 pub type Shrinker<T> = Box<dyn Iterator<Item = T>>;
@@ -56,25 +56,36 @@ macro_rules! arbitrary_int {
             }
 
             fn shrink(&self) -> Shrinker<Self> {
-                let x = *self as i128;
-                if x == 0 {
-                    return no_shrink();
-                }
-                let mut out = Vec::new();
-                if x < 0 && -x <= <$t>::MAX as i128 {
-                    out.push(-x as $t);
-                }
-                out.push(0);
-                // x - x/2, x - x/4, ... closes in on x from the zero side.
-                let mut d = x / 2;
-                while d != 0 {
-                    out.push((x - d) as $t);
-                    d /= 2;
-                }
-                Box::new(out.into_iter())
+                let max = <$t>::MAX as i128;
+                Box::new(
+                    shrink_toward_zero(*self as i128)
+                        .into_iter()
+                        .filter(move |c| *c <= max)
+                        .map(|c| c as $t),
+                )
             }
         }
     )*};
+}
+
+/// Integer shrink candidates, simplest first: the positive twin of a
+/// negative number, zero, then x - x/2, x - x/4, ... which closes in on x
+/// from the zero side.
+pub(crate) fn shrink_toward_zero(x: i128) -> Vec<i128> {
+    let mut out = Vec::new();
+    if x == 0 {
+        return out;
+    }
+    if x < 0 {
+        out.push(-x);
+    }
+    out.push(0);
+    let mut d = x / 2;
+    while d != 0 {
+        out.push(x - d);
+        d /= 2;
+    }
+    out
 }
 
 arbitrary_int!(i8, i16, i32, i64, isize, u8, u16, u32, u64, usize);
