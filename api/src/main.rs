@@ -35,7 +35,13 @@ Run:
   --seed <n>            Replay a run.
   --max-shrinks <n>     Requests spent shrinking one failure. Default: 500.
   --operation <text>    Only operations with this operationId, or with this
-                        text in 'METHOD /path'.
+                        text in 'METHOD /path'. May be repeated.
+  --exclude <text>      Leave out operations that match, same matching.
+                        May be repeated.
+  --exclude-from <file> Exclusions from a file, one per line, as
+                        'text  # reason'. The reason is printed with the
+                        skipped operation, which keeps known failures
+                        visible while the rest of the API is checked.
   --skip-check <name>   Disable a check: transport, no-server-error,
                         documented-status, content-type, response-schema.
   --dry-run             Print one generated request per operation and send
@@ -51,7 +57,9 @@ struct Args {
     exec: Option<String>,
     http: HttpOptions,
     options: Options,
-    operation: Option<String>,
+    operations: Vec<String>,
+    /// A filter and the reason for it.
+    excluded: Vec<(String, String)>,
     dry_run: bool,
 }
 
@@ -62,7 +70,8 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
         exec: None,
         http: HttpOptions::default(),
         options: Options::default(),
-        operation: None,
+        operations: Vec::new(),
+        excluded: Vec::new(),
         dry_run: false,
     };
     let mut rest = args.iter();
@@ -96,7 +105,22 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "--tests" => parsed.options.tests = number(value("a count")?)? as u32,
             "--seed" => parsed.options.seed = Some(number(value("a seed")?)?),
             "--max-shrinks" => parsed.options.max_shrinks = number(value("a count")?)? as u32,
-            "--operation" => parsed.operation = Some(value("a filter")?),
+            "--operation" => parsed.operations.push(value("a filter")?),
+            "--exclude" => parsed
+                .excluded
+                .push((value("a filter")?, "excluded".to_string())),
+            "--exclude-from" => {
+                let path = value("a file")?;
+                let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+                for line in text.lines() {
+                    let (filter, reason) = line.split_once('#').unwrap_or((line, "excluded"));
+                    if !filter.trim().is_empty() {
+                        parsed
+                            .excluded
+                            .push((filter.trim().to_string(), reason.trim().to_string()));
+                    }
+                }
+            }
             "--skip-check" => {
                 let name = value("a check name")?;
                 let check =
@@ -208,7 +232,7 @@ fn run(args: &Args) -> Result<bool, String> {
     let operations: Vec<Operation> = spec
         .operations()
         .into_iter()
-        .filter(|o| args.operation.as_deref().is_none_or(|f| o.matches(f)))
+        .filter(|o| args.operations.is_empty() || args.operations.iter().any(|f| o.matches(f)))
         .collect();
     if operations.is_empty() {
         return Err("no operation to check".into());
@@ -259,6 +283,11 @@ fn run(args: &Args) -> Result<bool, String> {
 
     let (mut passed, mut failed, mut skipped) = (0, 0, 0);
     for operation in &operations {
+        if let Some((_, reason)) = args.excluded.iter().find(|(f, _)| operation.matches(f)) {
+            skipped += 1;
+            println!("skip  {operation}: {reason}");
+            continue;
+        }
         match check_operation(operation, adapter.as_ref(), &options) {
             Verdict::Passed { tests } => {
                 passed += 1;

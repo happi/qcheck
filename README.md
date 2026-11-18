@@ -23,7 +23,7 @@ curl -fsSL -o qcheck https://github.com/happi/qcheck/releases/latest/download/qc
 chmod +x qcheck
 ```
 
-Pin a version in CI by replacing `latest/download` with `download/v0.1.0`.
+Pin a version in CI by replacing `latest/download` with `download/v0.1.1`.
 From source: `cargo build --release -p qcheck-api --bin qcheck` in a
 checkout, which picks up the build flag in `.cargo/config.toml`.
 
@@ -87,6 +87,14 @@ came from:
 
 ```
 qcheck openapi http://127.0.0.1:8000/openapi.json
+```
+
+Known failures go in a file, one operation per line with the reason
+after a `#`. `--exclude-from` skips them and prints the reason, so the rest
+of the API is checked and the list of open findings stays in view:
+
+```
+createPet   # 422 for names over ten characters, not documented
 ```
 
 The command exits with 1 when a check fails, so it fits a CI step.
